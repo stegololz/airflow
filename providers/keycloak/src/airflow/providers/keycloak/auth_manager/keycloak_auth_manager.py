@@ -28,6 +28,7 @@ from keycloak import KeycloakOpenID
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
 from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
+from airflow.api_fastapi.auth.managers.models.resource_details import DagDetails
 
 try:
     from airflow.api_fastapi.auth.managers.base_auth_manager import ExtendedResourceMethod
@@ -60,7 +61,6 @@ if TYPE_CHECKING:
         ConfigurationDetails,
         ConnectionDetails,
         DagAccessEntity,
-        DagDetails,
         PoolDetails,
         VariableDetails,
     )
@@ -150,12 +150,16 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     ) -> bool:
         dag_id = details.id if details else None
         access_entity_str = access_entity.value if access_entity else None
+        team_name = details.team_name if details else None
+        attributes: dict[str, str | None] = {"dag_entity": access_entity_str}
+        if team_name:
+            attributes["team_name"] = team_name
         return self._is_authorized(
             method=method,
             resource_type=KeycloakResource.DAG,
             user=user,
             resource_id=dag_id,
-            attributes={"dag_entity": access_entity_str},
+            attributes=attributes,
         )
 
     def is_batch_authorized_dag(
@@ -168,6 +172,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     ) -> bool:
         dag_id = details.id if details else None
         access_entity_str = access_entity.value if access_entity else None
+        team_name = details.team_name if details else None
 
         if dag_id or access_entity_str:
             return self.is_authorized_dag(
@@ -185,8 +190,35 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         authorized_permissions = self._is_batch_authorized(
             permissions=[permission],
             user=user,
+            attributes={"team_name": team_name} if team_name else None,
         )
         return permission in authorized_permissions
+
+    def filter_authorized_dag_ids(
+        self,
+        *,
+        dag_ids: set[str],
+        user: KeycloakAuthManagerUser,
+        method: ResourceMethod = "GET",
+        team_name: str | None = None,
+    ) -> set[str]:
+        """Filter DAGs in bulk when Keycloak policies allow global access."""
+        details = DagDetails(team_name=team_name) if team_name else None
+        if self.is_batch_authorized_dag(method=method, user=user, details=details):
+            log.info(
+                "KeycloakAuthManager bulk DAG authorization granted; returning %d DAGs for user %s team=%s",
+                len(dag_ids),
+                user.get_id(),
+                team_name or "*",
+            )
+            return dag_ids
+
+        return super().filter_authorized_dag_ids(
+            dag_ids=dag_ids,
+            user=user,
+            method=method,
+            team_name=team_name,
+        )
 
     def is_authorized_backfill(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: BackfillDetails | None = None
@@ -345,6 +377,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         permissions: list[tuple[ExtendedResourceMethod, str]],
         user: KeycloakAuthManagerUser,
+        attributes: dict[str, str | None] | None = None,
     ) -> set[tuple[ExtendedResourceMethod, str]]:
         client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
@@ -352,7 +385,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
         resp = requests.post(
             self._get_token_url(server_url, realm),
-            data=self._get_batch_payload(client_id, permissions),
+            data=self._get_batch_payload(client_id, permissions, attributes),
             headers=self._get_headers(user.access_token),
         )
 
@@ -384,13 +417,19 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         return payload
 
     @staticmethod
-    def _get_batch_payload(client_id: str, permissions: list[tuple[ExtendedResourceMethod, str]]):
+    def _get_batch_payload(
+        client_id: str,
+        permissions: list[tuple[ExtendedResourceMethod, str]],
+        attributes: dict[str, str | None] | None = None,
+    ):
         payload: dict[str, Any] = {
             "grant_type": "urn:ietf:params:oauth:grant-type:uma-ticket",
             "audience": client_id,
             "permission": [f"{permission[1]}#{permission[0]}" for permission in permissions],
             "response_mode": "permissions",
         }
+        if attributes:
+            payload["context"] = {"attributes": prune_dict(attributes)}
 
         return payload
 
