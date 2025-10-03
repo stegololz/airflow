@@ -68,6 +68,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
+MENU_SCOPE: ExtendedResourceMethod = "MENU"
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -157,6 +158,36 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             attributes={"dag_entity": access_entity_str},
         )
 
+    def is_batch_authorized_dag(
+        self,
+        *,
+        method: ResourceMethod,
+        user: KeycloakAuthManagerUser,
+        access_entity: DagAccessEntity | None = None,
+        details: DagDetails | None = None,
+    ) -> bool:
+        dag_id = details.id if details else None
+        access_entity_str = access_entity.value if access_entity else None
+
+        if dag_id or access_entity_str:
+            return self.is_authorized_dag(
+                method=method,
+                user=user,
+                access_entity=access_entity,
+                details=details,
+            )
+
+        batch_method: ExtendedResourceMethod = "LIST" if method == "GET" else method
+        permission: tuple[ExtendedResourceMethod, str] = (
+            batch_method,
+            KeycloakResource.DAG.value,
+        )
+        authorized_permissions = self._is_batch_authorized(
+            permissions=[permission],
+            user=user,
+        )
+        return permission in authorized_permissions
+
     def is_authorized_backfill(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: BackfillDetails | None = None
     ) -> bool:
@@ -222,8 +253,11 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def filter_authorized_menu_items(
         self, menu_items: list[MenuItem], *, user: KeycloakAuthManagerUser
     ) -> list[MenuItem]:
+        permissions: list[tuple[ExtendedResourceMethod, str]] = [
+            (MENU_SCOPE, menu_item.value) for menu_item in menu_items
+        ]
         authorized_menus = self._is_batch_authorized(
-            permissions=[("MENU", menu_item.value) for menu_item in menu_items],
+            permissions=permissions,
             user=user,
         )
         return [MenuItem(menu[1]) for menu in authorized_menus]
