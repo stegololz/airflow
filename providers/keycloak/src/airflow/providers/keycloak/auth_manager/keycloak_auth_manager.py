@@ -29,12 +29,6 @@ from keycloak import KeycloakOpenID
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
 from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
 from airflow.api_fastapi.auth.managers.models.resource_details import DagDetails
-
-try:
-    from airflow.api_fastapi.auth.managers.base_auth_manager import ExtendedResourceMethod
-except ImportError:
-    from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod as ExtendedResourceMethod
-
 from airflow.api_fastapi.common.types import MenuItem
 from airflow.cli.cli_config import CLICommand, DefaultHelpParser, GroupCommand
 from airflow.configuration import conf
@@ -68,7 +62,6 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
-MENU_SCOPE: ExtendedResourceMethod = "MENU"
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -182,8 +175,8 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
                 details=details,
             )
 
-        batch_method: ExtendedResourceMethod = "LIST" if method == "GET" else method
-        permission: tuple[ExtendedResourceMethod, str] = (
+        batch_method = "LIST" if method == "GET" else method
+        permission = (
             batch_method,
             KeycloakResource.DAG.value,
         )
@@ -285,9 +278,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def filter_authorized_menu_items(
         self, menu_items: list[MenuItem], *, user: KeycloakAuthManagerUser
     ) -> list[MenuItem]:
-        permissions: list[tuple[ExtendedResourceMethod, str]] = [
-            (MENU_SCOPE, menu_item.value) for menu_item in menu_items
-        ]
+        permissions = [("MENU", menu_item.value) for menu_item in menu_items]
         authorized_menus = self._is_batch_authorized(
             permissions=permissions,
             user=user,
@@ -375,10 +366,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def _is_batch_authorized(
         self,
         *,
-        permissions: list[tuple[ExtendedResourceMethod, str]],
+        permissions: list[tuple[ResourceMethod | str, str]],
         user: KeycloakAuthManagerUser,
         attributes: dict[str, str | None] | None = None,
-    ) -> set[tuple[ExtendedResourceMethod, str]]:
+    ) -> set[tuple[ResourceMethod | str, str]]:
         client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
         server_url = conf.get(CONF_SECTION_NAME, CONF_SERVER_URL_KEY)
@@ -419,7 +410,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     @staticmethod
     def _get_batch_payload(
         client_id: str,
-        permissions: list[tuple[ExtendedResourceMethod, str]],
+        permissions: list[tuple[ResourceMethod | str, str]],
         attributes: dict[str, str | None] | None = None,
     ):
         payload: dict[str, Any] = {
