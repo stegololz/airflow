@@ -17,7 +17,7 @@
 ---
 services:
   keycloak:
-    image: quay.io/keycloak/keycloak:23.0.6
+    image: quay.io/keycloak/keycloak:26.2.5
     labels:
       breeze.description: "Integration for manual testing of multi-team Airflow."
     entrypoint: /opt/keycloak/keycloak-entrypoint.sh
@@ -26,7 +26,7 @@ services:
       KC_HOSTNAME_PORT: 48080
       KC_HOSTNAME_STRICT_BACKCHANNEL: false
       KC_HTTP_ENABLED: true
-      KC_HOSTNAME_STRICT: true
+      KC_HOSTNAME_STRICT: false
 
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
