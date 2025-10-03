@@ -28,6 +28,12 @@ from keycloak import KeycloakOpenID
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
 from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
+
+try:
+    from airflow.api_fastapi.auth.managers.base_auth_manager import ExtendedResourceMethod
+except ImportError:
+    from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod as ExtendedResourceMethod
+
 from airflow.api_fastapi.auth.managers.models.resource_details import DagDetails
 from airflow.api_fastapi.common.types import MenuItem
 from airflow.cli.cli_config import CLICommand, DefaultHelpParser, GroupCommand
@@ -195,15 +201,8 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         method: ResourceMethod = "GET",
         team_name: str | None = None,
     ) -> set[str]:
-        """Filter DAGs in bulk when Keycloak policies allow global access."""
         details = DagDetails(team_name=team_name) if team_name else None
         if self.is_batch_authorized_dag(method=method, user=user, details=details):
-            log.info(
-                "KeycloakAuthManager bulk DAG authorization granted; returning %d DAGs for user %s team=%s",
-                len(dag_ids),
-                user.get_id(),
-                team_name or "*",
-            )
             return dag_ids
 
         return super().filter_authorized_dag_ids(
@@ -278,9 +277,8 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def filter_authorized_menu_items(
         self, menu_items: list[MenuItem], *, user: KeycloakAuthManagerUser
     ) -> list[MenuItem]:
-        permissions = [("MENU", menu_item.value) for menu_item in menu_items]
         authorized_menus = self._is_batch_authorized(
-            permissions=permissions,
+            permissions=[("MENU", menu_item.value) for menu_item in menu_items],
             user=user,
         )
         return [MenuItem(menu[1]) for menu in authorized_menus]
@@ -366,10 +364,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def _is_batch_authorized(
         self,
         *,
-        permissions: list[tuple[ResourceMethod | str, str]],
+        permissions: list[tuple[ExtendedResourceMethod | str, str]],
         user: KeycloakAuthManagerUser,
         attributes: dict[str, str | None] | None = None,
-    ) -> set[tuple[ResourceMethod | str, str]]:
+    ) -> set[tuple[str, str]]:
         client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
         server_url = conf.get(CONF_SECTION_NAME, CONF_SERVER_URL_KEY)

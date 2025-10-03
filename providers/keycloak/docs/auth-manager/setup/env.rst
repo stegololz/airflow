@@ -29,5 +29,5 @@ Setup and run Keycloak with Breeze (local development)
 ------------------------------------------------------
 
 Setting up and running a Keycloak environment with Breeze for local development is straightforward.
-Simply run ``breeze start-airflow --backend postgres --integration keycloak``. Breeze will handle starting Keycloak in a separate container.
+Simply run ``breeze start-airflow --integration keycloak``. Breeze will handle starting Keycloak in a separate container.
 The Keycloak admin console will be available at http://localhost:48080/.
