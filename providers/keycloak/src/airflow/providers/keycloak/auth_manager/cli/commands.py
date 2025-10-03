@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 @providers_configuration_loaded
 def create_scopes_command(args):
     """Create Keycloak auth manager scopes in Keycloak."""
+    debug_args = vars(args).copy()
+    if "password" in debug_args:
+        debug_args["password"] = "***"
+    log.info("[Keycloak CLI Debug] create_scopes_command called with args=%s", debug_args)
     client = _get_client(args)
     client_uuid = _get_client_uuid(args)
 
@@ -88,6 +92,22 @@ def create_all_command(args):
 def _get_client(args):
     server_url = conf.get(CONF_SECTION_NAME, CONF_SERVER_URL_KEY)
     realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
+    if not server_url or not realm:
+        log.info(
+            "[Keycloak CLI Debug] Keycloak config missing values: server_url=%s realm=%s",
+            server_url,
+            realm,
+        )
+    else:
+        log.info(
+            "[Keycloak CLI Debug] Building KeycloakAdmin with server_url=%s realm=%s user_realm=%s "
+            "username=%s client_id=%s",
+            server_url,
+            realm,
+            getattr(args, "user_realm", None),
+            getattr(args, "username", None),
+            getattr(args, "client_id", None),
+        )
 
     return KeycloakAdmin(
         server_url=server_url,
@@ -104,6 +124,12 @@ def _get_client_uuid(args):
     client = _get_client(args)
     clients = client.get_clients()
     client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
+    log.info(
+        "[Keycloak CLI Debug] Fetched %d clients from realm %s when looking for client_id=%s",
+        len(clients),
+        getattr(client, "realm_name", None),
+        client_id,
+    )
 
     matches = [client for client in clients if client["clientId"] == client_id]
     if not matches:
@@ -113,6 +139,20 @@ def _get_client_uuid(args):
 
 
 def _create_scopes(client: KeycloakAdmin, client_uuid: str):
+    connection = getattr(client, "connection", None)
+    server_url = getattr(connection, "server_url", None) if connection else None
+    realm_name = getattr(client, "realm_name", None)
+    user_realm_name = getattr(client, "user_realm_name", None)
+    client_id = getattr(client, "client_id", None)
+    log.info(
+        "[Keycloak CLI Debug] Creating scopes with client info: server_url=%s, realm_name=%s, "
+        "user_realm_name=%s, client_id=%s, client_uuid=%s",
+        server_url,
+        realm_name,
+        user_realm_name,
+        client_id,
+        client_uuid,
+    )
     scopes = [{"name": method} for method in get_args(ResourceMethod)]
     scopes.extend([{"name": "MENU"}, {"name": "LIST"}])
     for scope in scopes:
