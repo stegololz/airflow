@@ -26,7 +26,7 @@ services:
       KC_HOSTNAME_PORT: 48080
       KC_HOSTNAME_STRICT_BACKCHANNEL: false
       KC_HTTP_ENABLED: true
-      KC_HOSTNAME_STRICT: false
+      KC_HOSTNAME_STRICT: true
 
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
