@@ -170,7 +170,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             attributes=attributes,
         )
 
-    def is_batch_authorized_dag(
+    def _is_authorized_to_list_dags(
         self,
         *,
         method: ResourceMethod,
@@ -214,7 +214,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         team_name: str | None = None,
     ) -> set[str]:
         details = self._build_dag_details_with_team(team_name)
-        if self.is_batch_authorized_dag(method=method, user=user, details=details):
+        if self._is_authorized_to_list_dags(method=method, user=user, details=details):
             return dag_ids
 
         return super().filter_authorized_dag_ids(

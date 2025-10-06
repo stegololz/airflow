@@ -430,11 +430,11 @@ class TestKeycloakAuthManager:
         assert len(auth_manager.get_cli_commands()) == 1
 
     @patch.object(KeycloakAuthManager, "_is_batch_authorized")
-    def test_is_batch_authorized_dag_with_team_uses_attributes(self, mock_batch, auth_manager, user):
+    def test__is_authorized_to_list_dags_with_team_uses_attributes(self, mock_batch, auth_manager, user):
         mock_batch.return_value = {("LIST", "Dag")}
         details = DagDetails(team_name="team-blue")
 
-        result = auth_manager.is_batch_authorized_dag(method="GET", user=user, details=details)
+        result = auth_manager._is_authorized_to_list_dags(method="GET", user=user, details=details)
 
         assert result is True
         mock_batch.assert_called_once()
@@ -443,10 +443,10 @@ class TestKeycloakAuthManager:
         assert kwargs["attributes"] == {"team_name": "team-blue"}
 
     @patch.object(KeycloakAuthManager, "_is_batch_authorized")
-    def test_is_batch_authorized_dag_without_team(self, mock_batch, auth_manager, user):
+    def test__is_authorized_to_list_dags_without_team(self, mock_batch, auth_manager, user):
         mock_batch.return_value = {("LIST", "Dag")}
 
-        result = auth_manager.is_batch_authorized_dag(method="GET", user=user, details=None)
+        result = auth_manager._is_authorized_to_list_dags(method="GET", user=user, details=None)
 
         assert result is True
         mock_batch.assert_called_once()
@@ -457,7 +457,7 @@ class TestKeycloakAuthManager:
     def test_filter_authorized_dag_ids_returns_all_when_batch_granted(self, auth_manager, user):
         dag_ids = {"dag_a", "dag_b"}
         with (
-            patch.object(KeycloakAuthManager, "is_batch_authorized_dag", return_value=True) as mock_batch,
+            patch.object(KeycloakAuthManager, "_is_authorized_to_list_dags", return_value=True) as mock_batch,
             patch.object(BaseAuthManager, "filter_authorized_dag_ids") as mock_super,
         ):
             result = auth_manager.filter_authorized_dag_ids(
@@ -475,7 +475,9 @@ class TestKeycloakAuthManager:
 
     def test_filter_authorized_dag_ids_fallbacks_when_batch_denied(self, auth_manager, user):
         with (
-            patch.object(KeycloakAuthManager, "is_batch_authorized_dag", return_value=False) as mock_batch,
+            patch.object(
+                KeycloakAuthManager, "_is_authorized_to_list_dags", return_value=False
+            ) as mock_batch,
             patch.object(
                 BaseAuthManager, "filter_authorized_dag_ids", return_value={"filtered"}
             ) as mock_super,
