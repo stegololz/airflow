@@ -88,6 +88,15 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     Leverages Keycloak to perform authentication and authorization in Airflow.
     """
 
+    @staticmethod
+    def _build_dag_details_with_team(team_name: str | None) -> DagDetails | None:
+        if not team_name:
+            return None
+        try:
+            return DagDetails(team_name=team_name)
+        except TypeError:
+            return None
+
     def deserialize_user(self, token: dict[str, Any]) -> KeycloakAuthManagerUser:
         return KeycloakAuthManagerUser(
             user_id=token.pop("user_id"),
@@ -149,7 +158,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     ) -> bool:
         dag_id = details.id if details else None
         access_entity_str = access_entity.value if access_entity else None
-        team_name = details.team_name if details else None
+        team_name = getattr(details, "team_name", None)
         attributes: dict[str, str | None] = {"dag_entity": access_entity_str}
         if team_name:
             attributes["team_name"] = team_name
@@ -171,7 +180,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     ) -> bool:
         dag_id = details.id if details else None
         access_entity_str = access_entity.value if access_entity else None
-        team_name = details.team_name if details else None
+        team_name = getattr(details, "team_name", None)
 
         if dag_id or access_entity_str:
             return self.is_authorized_dag(
@@ -204,7 +213,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         method: ResourceMethod = "GET",
         team_name: str | None = None,
     ) -> set[str]:
-        details = DagDetails(team_name=team_name) if team_name else None
+        details = self._build_dag_details_with_team(team_name)
         if self.is_batch_authorized_dag(method=method, user=user, details=details):
             return dag_ids
 
