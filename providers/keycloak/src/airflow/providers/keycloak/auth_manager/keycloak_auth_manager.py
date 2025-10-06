@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin
 
 import requests
@@ -181,7 +181,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
                 details=details,
             )
 
-        batch_method = "LIST" if method == "GET" else method
+        if method == "GET":
+            batch_method: ExtendedResourceMethod = "LIST"
+        else:
+            batch_method = cast("ExtendedResourceMethod", method)
         permission = (
             batch_method,
             KeycloakResource.DAG.value,
@@ -364,7 +367,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def _is_batch_authorized(
         self,
         *,
-        permissions: list[tuple[ExtendedResourceMethod | str, str]],
+        permissions: list[tuple[ExtendedResourceMethod, str]],
         user: KeycloakAuthManagerUser,
         attributes: dict[str, str | None] | None = None,
     ) -> set[tuple[str, str]]:
@@ -408,7 +411,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     @staticmethod
     def _get_batch_payload(
         client_id: str,
-        permissions: list[tuple[ResourceMethod | str, str]],
+        permissions: list[tuple[ExtendedResourceMethod, str]],
         attributes: dict[str, str | None] | None = None,
     ):
         payload: dict[str, Any] = {
