@@ -543,9 +543,9 @@ class TestKeycloakAuthManager:
         submit_mock.assert_not_called()
 
     def test_notify_role_change_marks_pending_and_clears_cache(self, auth_manager, user):
-        auth_manager._dag_permissions_cache[
-            ("user_id", "dag_a", "GET", None)
-        ] = _DagPermissionCacheEntry(expires_at=10.0, allowed=True)
+        auth_manager._dag_permissions_cache[("user_id", "dag_a", "GET", None)] = _DagPermissionCacheEntry(
+            expires_at=10.0, allowed=True
+        )
 
         auth_manager.notify_role_change(user_id="user_id")
 
