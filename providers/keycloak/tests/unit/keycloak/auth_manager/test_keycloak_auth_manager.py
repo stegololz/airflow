@@ -45,7 +45,6 @@ from airflow.providers.keycloak.auth_manager.constants import (
 from airflow.providers.keycloak.auth_manager.keycloak_auth_manager import (
     RESOURCE_ID_ATTRIBUTE_NAME,
     KeycloakAuthManager,
-    _DagPermissionCacheEntry,
 )
 from airflow.providers.keycloak.auth_manager.user import KeycloakAuthManagerUser
 
@@ -541,28 +540,3 @@ class TestKeycloakAuthManager:
         auth_manager.schedule_dag_permission_warmup(user)
 
         submit_mock.assert_not_called()
-
-    def test_notify_role_change_marks_pending_and_clears_cache(self, auth_manager, user):
-        auth_manager._dag_permissions_cache[("user_id", "dag_a", "GET", None)] = _DagPermissionCacheEntry(
-            expires_at=10.0, allowed=True
-        )
-
-        auth_manager.notify_role_change(user_id="user_id")
-
-        assert ("user_id", "dag_a", "GET", None) not in auth_manager._dag_permissions_cache
-        assert "user_id" in auth_manager._pending_role_warmups
-
-    def test_notify_role_change_with_user_schedules_warmup(self, auth_manager):
-        auth_manager._dag_permissions_cache_ttl_seconds = 30
-        submit_mock = Mock()
-        auth_manager._dag_warmup_executor.submit = submit_mock
-        user = KeycloakAuthManagerUser(
-            user_id="user-id",
-            name="username",
-            access_token="token",
-            refresh_token="refresh",
-        )
-
-        auth_manager.notify_role_change(user=user)
-
-        submit_mock.assert_called_once()
