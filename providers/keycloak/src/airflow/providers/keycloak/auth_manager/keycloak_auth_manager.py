@@ -19,12 +19,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from typing import TYPE_CHECKING, Any, cast
+import threading
+import weakref
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from time import monotonic
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from urllib.parse import urljoin
 
 import requests
 from fastapi import FastAPI
 from keycloak import KeycloakOpenID
+from sqlalchemy import select
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
 from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
@@ -39,10 +45,15 @@ from airflow.api_fastapi.common.types import MenuItem
 from airflow.cli.cli_config import CLICommand, DefaultHelpParser, GroupCommand
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException
+from airflow.models import DagModel
+from airflow.models.dagbundle import DagBundleModel
+from airflow.models.team import Team, dag_bundle_team_association_table
 from airflow.providers.keycloak.auth_manager.cli.definition import KEYCLOAK_AUTH_MANAGER_COMMANDS
 from airflow.providers.keycloak.auth_manager.constants import (
     CONF_CLIENT_ID_KEY,
     CONF_CLIENT_SECRET_KEY,
+    CONF_DAG_PERMISSIONS_CACHE_TTL_KEY,
+    CONF_DAG_INVENTORY_CACHE_TTL_KEY,
     CONF_REALM_KEY,
     CONF_SECTION_NAME,
     CONF_SERVER_URL_KEY,
@@ -50,6 +61,7 @@ from airflow.providers.keycloak.auth_manager.constants import (
 from airflow.providers.keycloak.auth_manager.resources import KeycloakResource
 from airflow.providers.keycloak.auth_manager.user import KeycloakAuthManagerUser
 from airflow.utils.helpers import prune_dict
+from airflow.utils.session import NEW_SESSION, provide_session
 
 if TYPE_CHECKING:
     from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
@@ -64,10 +76,16 @@ if TYPE_CHECKING:
         PoolDetails,
         VariableDetails,
     )
+    from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
 
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
+
+
+class _DagPermissionCacheEntry(NamedTuple):
+    expires_at: float
+    allowed: bool
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -88,14 +106,34 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     Leverages Keycloak to perform authentication and authorization in Airflow.
     """
 
-    @staticmethod
-    def _build_dag_details_with_team(team_name: str | None) -> DagDetails | None:
-        if not team_name:
-            return None
-        try:
-            return DagDetails(team_name=team_name)
-        except TypeError:
-            return None
+    def __init__(self) -> None:
+        super().__init__()
+        self._dag_permissions_cache_ttl_seconds = conf.getint(
+            CONF_SECTION_NAME,
+            CONF_DAG_PERMISSIONS_CACHE_TTL_KEY,
+            fallback=30,
+        )
+        self._dag_inventory_cache_ttl_seconds = conf.getint(
+            CONF_SECTION_NAME,
+            CONF_DAG_INVENTORY_CACHE_TTL_KEY,
+            fallback=300,
+        )
+        self._dag_permissions_cache: dict[tuple[str, str, str, str | None], _DagPermissionCacheEntry] = {}
+        self._dag_permissions_cache_lock = threading.RLock()
+        self._dag_inventory: dict[str | None, set[str]] | None = None
+        self._dag_inventory_last_refreshed: float | None = None
+        self._dag_inventory_lock = threading.RLock()
+        self._dag_warmup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="keycloak-dag-warm")
+        self._warmup_executor_finalizer = weakref.finalize(self, self._dag_warmup_executor.shutdown, wait=False)
+        self._dag_warmup_lock = threading.RLock()
+        self._dag_warmup_inflight: set[str] = set()
+        self._pending_role_warmups: set[str] = set()
+
+    def init(self) -> None:
+        super().init()
+        if self._dag_permissions_cache_ttl_seconds <= 0:
+            return
+        self._dag_warmup_executor.submit(self._prime_dag_inventory)
 
     def deserialize_user(self, token: dict[str, Any]) -> KeycloakAuthManagerUser:
         return KeycloakAuthManagerUser(
@@ -170,40 +208,172 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             attributes=attributes,
         )
 
-    def _is_authorized_to_list_dags(
+    def _get_cached_dag_permission(
+        self,
+        cache_key: tuple[str, str, str, str | None],
+        *,
+        now: float,
+    ) -> bool | None:
+        if self._dag_permissions_cache_ttl_seconds <= 0:
+            return None
+
+        with self._dag_permissions_cache_lock:
+            cached = self._dag_permissions_cache.get(cache_key)
+            if not cached:
+                return None
+            if cached.expires_at <= now:
+                self._dag_permissions_cache.pop(cache_key, None)
+                return None
+            return cached.allowed
+
+    def _set_cached_dag_permission(
+        self,
+        cache_key: tuple[str, str, str, str | None],
+        allowed: bool,
+        *,
+        now: float,
+    ) -> None:
+        if self._dag_permissions_cache_ttl_seconds <= 0:
+            return
+
+        expires_at = now + self._dag_permissions_cache_ttl_seconds
+        with self._dag_permissions_cache_lock:
+            self._dag_permissions_cache[cache_key] = _DagPermissionCacheEntry(expires_at, allowed)
+
+    def _prime_dag_inventory(self) -> None:
+        try:
+            inventory = self._fetch_dag_inventory()
+            with self._dag_inventory_lock:
+                self._dag_inventory = inventory
+                self._dag_inventory_last_refreshed = monotonic()
+        except Exception:
+            log.exception("Failed to prime DAG inventory for permissions warmup")
+
+    def _get_dag_inventory(self) -> dict[str | None, set[str]]:
+        if self._dag_inventory_cache_ttl_seconds <= 0:
+            return self._fetch_dag_inventory()
+
+        with self._dag_inventory_lock:
+            inventory = self._dag_inventory
+            last_refreshed = self._dag_inventory_last_refreshed
+
+        current_time = monotonic()
+        if (
+            inventory is not None
+            and last_refreshed is not None
+            and current_time - last_refreshed < self._dag_inventory_cache_ttl_seconds
+        ):
+            return {team: set(dag_ids) for team, dag_ids in inventory.items()}
+
+        inventory = self._fetch_dag_inventory()
+        with self._dag_inventory_lock:
+            self._dag_inventory = inventory
+            self._dag_inventory_last_refreshed = monotonic()
+        return inventory
+
+    @staticmethod
+    @provide_session
+    def _fetch_dag_inventory(*, session: "Session" = NEW_SESSION) -> dict[str | None, set[str]]:
+        stmt = (
+            select(DagModel.dag_id, Team.name)
+            .join(DagBundleModel, DagModel.bundle_name == DagBundleModel.name)
+            .join(
+                dag_bundle_team_association_table,
+                DagBundleModel.name == dag_bundle_team_association_table.c.dag_bundle_name,
+                isouter=True,
+            )
+            .join(Team, Team.id == dag_bundle_team_association_table.c.team_id, isouter=True)
+        )
+        rows = session.execute(stmt).all()
+        dags_by_team: dict[str | None, set[str]] = defaultdict(set)
+        for dag_id, team_name in rows:
+            dags_by_team[team_name].add(dag_id)
+        return {team: set(dag_ids) for team, dag_ids in dags_by_team.items()}
+
+    def _warmup_user_dag_permissions(
+        self,
+        user: KeycloakAuthManagerUser,
+        method: ResourceMethod = "GET",
+    ) -> None:
+        user_id = str(user.get_id())
+        method_value = cast(ExtendedResourceMethod, method)
+        try:
+            dag_inventory = self._get_dag_inventory()
+            if not dag_inventory:
+                return
+
+            for team_name, dag_ids in dag_inventory.items():
+                if not dag_ids:
+                    continue
+                attributes = {"team_name": team_name} if team_name else None
+                permissions = [(method_value, dag_id) for dag_id in dag_ids]
+
+                try:
+                    authorized_pairs = self._is_batch_authorized(
+                        permissions=permissions,
+                        user=user,
+                        attributes=attributes,
+                    )
+                except Exception:
+                    log.exception("Failed to warm DAG permissions for user %s and team %s", user_id, team_name)
+                    continue
+
+                authorized_lookup = {(scope, resource) for scope, resource in authorized_pairs}
+                cache_time = monotonic()
+                for dag_id in dag_ids:
+                    allowed = (method_value, dag_id) in authorized_lookup
+                    cache_key = (user_id, dag_id, method_value, team_name)
+                    self._set_cached_dag_permission(cache_key, allowed, now=cache_time)
+        except Exception:
+            log.exception("Failed to warm DAG permissions for user %s", user_id)
+        finally:
+            with self._dag_warmup_lock:
+                self._dag_warmup_inflight.discard(user_id)
+
+    def _evict_user_dag_cache(self, user_id: str) -> None:
+        with self._dag_permissions_cache_lock:
+            keys_to_delete = [key for key in self._dag_permissions_cache if key[0] == user_id]
+            for key in keys_to_delete:
+                self._dag_permissions_cache.pop(key, None)
+
+    def schedule_dag_permission_warmup(
+        self,
+        user: KeycloakAuthManagerUser,
+        *,
+        method: ResourceMethod = "GET",
+    ) -> None:
+        if self._dag_permissions_cache_ttl_seconds <= 0:
+            return
+
+        user_snapshot = KeycloakAuthManagerUser(
+            user_id=str(user.get_id()),
+            name=str(user.get_name()),
+            access_token=getattr(user, "access_token", ""),
+            refresh_token=getattr(user, "refresh_token", ""),
+        )
+        user_id = user_snapshot.get_id()
+        with self._dag_warmup_lock:
+            if user_id in self._dag_warmup_inflight:
+                return
+            self._dag_warmup_inflight.add(user_id)
+            self._pending_role_warmups.discard(user_id)
+        self._dag_warmup_executor.submit(self._warmup_user_dag_permissions, user_snapshot, method)
+
+    def notify_role_change(
         self,
         *,
-        method: ResourceMethod,
-        user: KeycloakAuthManagerUser,
-        access_entity: DagAccessEntity | None = None,
-        details: DagDetails | None = None,
-    ) -> bool:
-        dag_id = details.id if details else None
-        access_entity_str = access_entity.value if access_entity else None
-        team_name = getattr(details, "team_name", None)
+        user: KeycloakAuthManagerUser | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        if user is None and user_id is None:
+            raise ValueError("Either user or user_id must be provided to notify role change")
 
-        if dag_id or access_entity_str:
-            return self.is_authorized_dag(
-                method=method,
-                user=user,
-                access_entity=access_entity,
-                details=details,
-            )
-
-        if method == "GET":
-            batch_method: ExtendedResourceMethod = "LIST"
-        else:
-            batch_method = cast("ExtendedResourceMethod", method)
-        permission = (
-            batch_method,
-            KeycloakResource.DAG.value,
-        )
-        authorized_permissions = self._is_batch_authorized(
-            permissions=[permission],
-            user=user,
-            attributes={"team_name": team_name} if team_name else None,
-        )
-        return permission in authorized_permissions
+        resolved_user_id = user_id or str(user.get_id())
+        self._evict_user_dag_cache(resolved_user_id)
+        with self._dag_warmup_lock:
+            self._pending_role_warmups.add(resolved_user_id)
+        if user is not None:
+            self.schedule_dag_permission_warmup(user)
 
     def filter_authorized_dag_ids(
         self,
@@ -213,16 +383,48 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         method: ResourceMethod = "GET",
         team_name: str | None = None,
     ) -> set[str]:
-        details = self._build_dag_details_with_team(team_name)
-        if self._is_authorized_to_list_dags(method=method, user=user, details=details):
-            return dag_ids
+        if not dag_ids:
+            return set()
 
-        return super().filter_authorized_dag_ids(
-            dag_ids=dag_ids,
-            user=user,
-            method=method,
-            team_name=team_name,
-        )
+        user_id = str(user.get_id())
+        with self._dag_warmup_lock:
+            pending_warmup = user_id in self._pending_role_warmups
+        if pending_warmup:
+            self.schedule_dag_permission_warmup(user)
+
+        method_value = cast(ExtendedResourceMethod, method)
+        lookup_attributes: dict[str, str | None] | None = None
+        if team_name:
+            lookup_attributes = {"team_name": team_name}
+
+        now = monotonic()
+        authorized_dags: set[str] = set()
+        dag_ids_to_check: list[tuple[str, tuple[str, str, str, str | None]]] = []
+        for dag_id in dag_ids:
+            cache_key = (user_id, dag_id, method_value, team_name)
+            cached_permission = self._get_cached_dag_permission(cache_key, now=now)
+            if cached_permission is None:
+                dag_ids_to_check.append((dag_id, cache_key))
+                continue
+            if cached_permission:
+                authorized_dags.add(dag_id)
+
+        if dag_ids_to_check:
+            permissions = [(method_value, dag_id) for dag_id, _ in dag_ids_to_check]
+            authorized_pairs = self._is_batch_authorized(
+                permissions=permissions,
+                user=user,
+                attributes=lookup_attributes,
+            )
+            authorized_lookup = {(scope, resource) for scope, resource in authorized_pairs}
+            cache_time = monotonic()
+            for dag_id, cache_key in dag_ids_to_check:
+                is_authorized = (method_value, dag_id) in authorized_lookup
+                if is_authorized:
+                    authorized_dags.add(dag_id)
+                self._set_cached_dag_permission(cache_key, is_authorized, now=cache_time)
+
+        return authorized_dags
 
     def is_authorized_backfill(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: BackfillDetails | None = None

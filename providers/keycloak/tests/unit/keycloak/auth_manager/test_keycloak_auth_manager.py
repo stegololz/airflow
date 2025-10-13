@@ -22,7 +22,6 @@ from unittest.mock import Mock, patch
 import pytest
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
-from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
 from airflow.api_fastapi.auth.managers.models.resource_details import (
     AccessView,
     AssetAliasDetails,
@@ -46,6 +45,7 @@ from airflow.providers.keycloak.auth_manager.constants import (
 from airflow.providers.keycloak.auth_manager.keycloak_auth_manager import (
     RESOURCE_ID_ATTRIBUTE_NAME,
     KeycloakAuthManager,
+    _DagPermissionCacheEntry,
 )
 from airflow.providers.keycloak.auth_manager.user import KeycloakAuthManagerUser
 
@@ -68,7 +68,9 @@ def auth_manager():
 def user():
     user = Mock()
     user.access_token = "access_token"
+    user.refresh_token = "refresh_token"
     user.get_id.return_value = "user_id"
+    user.get_name.return_value = "user_name"
     return user
 
 
@@ -430,71 +432,137 @@ class TestKeycloakAuthManager:
         assert len(auth_manager.get_cli_commands()) == 1
 
     @patch.object(KeycloakAuthManager, "_is_batch_authorized")
-    def test__is_authorized_to_list_dags_with_team_uses_attributes(self, mock_batch, auth_manager, user):
-        mock_batch.return_value = {("LIST", "Dag")}
-        details = DagDetails(team_name="team-blue")
+    def test_filter_authorized_dag_ids_uses_batch_permissions(
+        self, mock_is_batch_authorized, auth_manager, user
+    ):
+        dag_ids = {"dag_a", "dag_b", "dag_c"}
+        mock_is_batch_authorized.return_value = {("GET", "dag_a"), ("GET", "dag_c")}
 
-        result = auth_manager._is_authorized_to_list_dags(method="GET", user=user, details=details)
+        result = auth_manager.filter_authorized_dag_ids(
+            dag_ids=dag_ids,
+            user=user,
+            method="GET",
+            team_name="team-blue",
+        )
 
-        assert result is True
-        mock_batch.assert_called_once()
-        _, kwargs = mock_batch.call_args
-        assert kwargs["permissions"] == [("LIST", "Dag")]
-        assert kwargs["attributes"] == {"team_name": "team-blue"}
+        assert result == {"dag_a", "dag_c"}
+        assert mock_is_batch_authorized.call_count == 1
+        call_kwargs = mock_is_batch_authorized.call_args.kwargs
+        assert call_kwargs["user"] is user
+        assert call_kwargs["attributes"] == {"team_name": "team-blue"}
+        assert set(call_kwargs["permissions"]) == {("GET", "dag_a"), ("GET", "dag_b"), ("GET", "dag_c")}
 
     @patch.object(KeycloakAuthManager, "_is_batch_authorized")
-    def test__is_authorized_to_list_dags_without_team(self, mock_batch, auth_manager, user):
-        mock_batch.return_value = {("LIST", "Dag")}
+    @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.monotonic")
+    def test_filter_authorized_dag_ids_uses_cache(
+        self,
+        mock_monotonic,
+        mock_is_batch_authorized,
+        auth_manager,
+        user,
+    ):
+        mock_monotonic.side_effect = [1.0, 1.1, 2.0]
+        mock_is_batch_authorized.return_value = {("GET", "dag_a")}
+        auth_manager._dag_permissions_cache_ttl_seconds = 30
 
-        result = auth_manager._is_authorized_to_list_dags(method="GET", user=user, details=None)
-
-        assert result is True
-        mock_batch.assert_called_once()
-        _, kwargs = mock_batch.call_args
-        assert kwargs["permissions"] == [("LIST", "Dag")]
-        assert kwargs["attributes"] is None
-
-    def test_filter_authorized_dag_ids_returns_all_when_batch_granted(self, auth_manager, user):
         dag_ids = {"dag_a", "dag_b"}
-        with (
-            patch.object(KeycloakAuthManager, "_is_authorized_to_list_dags", return_value=True) as mock_batch,
-            patch.object(BaseAuthManager, "filter_authorized_dag_ids") as mock_super,
-        ):
-            result = auth_manager.filter_authorized_dag_ids(
-                dag_ids=dag_ids,
-                user=user,
-                method="GET",
-                team_name="team-blue",
-            )
 
-        assert result == dag_ids
-        mock_batch.assert_called_once()
-        expected_details = DagDetails(team_name="team-blue")
-        assert mock_batch.call_args.kwargs["details"] == expected_details
-        mock_super.assert_not_called()
+        first = auth_manager.filter_authorized_dag_ids(
+            dag_ids=dag_ids,
+            user=user,
+            method="GET",
+            team_name=None,
+        )
+        second = auth_manager.filter_authorized_dag_ids(
+            dag_ids=dag_ids,
+            user=user,
+            method="GET",
+            team_name=None,
+        )
 
-    def test_filter_authorized_dag_ids_fallbacks_when_batch_denied(self, auth_manager, user):
-        with (
-            patch.object(
-                KeycloakAuthManager, "_is_authorized_to_list_dags", return_value=False
-            ) as mock_batch,
-            patch.object(
-                BaseAuthManager, "filter_authorized_dag_ids", return_value={"filtered"}
-            ) as mock_super,
-        ):
-            result = auth_manager.filter_authorized_dag_ids(
-                dag_ids={"dag_a"},
-                user=user,
-                method="GET",
-                team_name=None,
-            )
+        assert first == {"dag_a"}
+        assert second == {"dag_a"}
+        assert mock_is_batch_authorized.call_count == 1
 
-        assert result == {"filtered"}
-        mock_batch.assert_called_once()
-        mock_super.assert_called_once()
-        assert mock_super.call_args.kwargs == {
-            "dag_ids": {"dag_a"},
-            "user": user,
-            "method": "GET",
-            "team_name": None,
-        }
+    @patch.object(KeycloakAuthManager, "_is_batch_authorized")
+    @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.monotonic")
+    def test_filter_authorized_dag_ids_cache_expires(
+        self,
+        mock_monotonic,
+        mock_is_batch_authorized,
+        auth_manager,
+        user,
+    ):
+        mock_monotonic.side_effect = [1.0, 1.1, 10.0, 10.1]
+        mock_is_batch_authorized.side_effect = [
+            {("GET", "dag_a")},
+            {("GET", "dag_a")},
+        ]
+        auth_manager._dag_permissions_cache_ttl_seconds = 5
+
+        dag_ids = {"dag_a"}
+
+        first = auth_manager.filter_authorized_dag_ids(
+            dag_ids=dag_ids,
+            user=user,
+            method="GET",
+            team_name=None,
+        )
+        second = auth_manager.filter_authorized_dag_ids(
+            dag_ids=dag_ids,
+            user=user,
+            method="GET",
+            team_name=None,
+        )
+
+        assert first == {"dag_a"}
+        assert second == {"dag_a"}
+        assert mock_is_batch_authorized.call_count == 2
+
+    def test_schedule_dag_permission_warmup_submits_task(self, auth_manager, user):
+        auth_manager._dag_permissions_cache_ttl_seconds = 30
+        submit_mock = Mock()
+        auth_manager._dag_warmup_executor.submit = submit_mock
+
+        auth_manager.schedule_dag_permission_warmup(user)
+        auth_manager.schedule_dag_permission_warmup(user)
+
+        submit_mock.assert_called_once()
+        scheduled_callable, scheduled_user, scheduled_method = submit_mock.call_args.args
+        assert scheduled_callable == auth_manager._warmup_user_dag_permissions
+        assert scheduled_user.get_id() == user.get_id()
+        assert scheduled_method == "GET"
+
+    def test_schedule_dag_permission_warmup_skipped_when_ttl_disabled(self, auth_manager, user):
+        auth_manager._dag_permissions_cache_ttl_seconds = 0
+        submit_mock = Mock()
+        auth_manager._dag_warmup_executor.submit = submit_mock
+
+        auth_manager.schedule_dag_permission_warmup(user)
+
+        submit_mock.assert_not_called()
+
+    def test_notify_role_change_marks_pending_and_clears_cache(self, auth_manager, user):
+        auth_manager._dag_permissions_cache[
+            ("user_id", "dag_a", "GET", None)
+        ] = _DagPermissionCacheEntry(expires_at=10.0, allowed=True)
+
+        auth_manager.notify_role_change(user_id="user_id")
+
+        assert ("user_id", "dag_a", "GET", None) not in auth_manager._dag_permissions_cache
+        assert "user_id" in auth_manager._pending_role_warmups
+
+    def test_notify_role_change_with_user_schedules_warmup(self, auth_manager):
+        auth_manager._dag_permissions_cache_ttl_seconds = 30
+        submit_mock = Mock()
+        auth_manager._dag_warmup_executor.submit = submit_mock
+        user = KeycloakAuthManagerUser(
+            user_id="user-id",
+            name="username",
+            access_token="token",
+            refresh_token="refresh",
+        )
+
+        auth_manager.notify_role_change(user=user)
+
+        submit_mock.assert_called_once()
