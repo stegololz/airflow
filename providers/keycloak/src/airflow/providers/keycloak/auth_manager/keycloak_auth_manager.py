@@ -84,6 +84,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
+ContextAttributes = dict[str, str | None]
+OptionalContextAttributes = ContextAttributes | None
+CacheKey = tuple[str, str, ExtendedResourceMethod, str | None]
 
 
 class _DagPermissionCacheEntry(NamedTuple):
@@ -121,7 +124,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             CONF_DAG_INVENTORY_CACHE_TTL_KEY,
             fallback=300,
         )
-        self._dag_permissions_cache: dict[tuple[str, str, str, str | None], _DagPermissionCacheEntry] = {}
+        self._dag_permissions_cache: dict[CacheKey, _DagPermissionCacheEntry] = {}
         self._dag_permissions_cache_lock = threading.RLock()
         self._dag_inventory: dict[str | None, set[str]] | None = None
         self._dag_inventory_last_refreshed: float | None = None
@@ -140,7 +143,6 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         )
         self._dag_warmup_lock = threading.RLock()
         self._dag_warmup_inflight: set[str] = set()
-        self._pending_role_warmups: set[str] = set()
 
     def init(self) -> None:
         super().init()
@@ -210,7 +212,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         dag_id = details.id if details else None
         access_entity_str = access_entity.value if access_entity else None
         team_name = getattr(details, "team_name", None)
-        attributes: dict[str, str | None] = {"dag_entity": access_entity_str}
+        attributes: ContextAttributes = {"dag_entity": access_entity_str}
         if team_name:
             attributes["team_name"] = team_name
         return self._is_authorized(
@@ -223,7 +225,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
     def _get_cached_dag_permission(
         self,
-        cache_key: tuple[str, str, str, str | None],
+        cache_key: CacheKey,
         *,
         now: float,
     ) -> bool | None:
@@ -241,7 +243,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
     def _set_cached_dag_permission(
         self,
-        cache_key: tuple[str, str, str, str | None],
+        cache_key: CacheKey,
         allowed: bool,
         *,
         now: float,
@@ -318,9 +320,9 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             for team_name, dag_ids in dag_inventory.items():
                 if not dag_ids:
                     continue
-                attributes: dict[str, str | None] | None = {"team_name": team_name} if team_name else None
+                attributes: OptionalContextAttributes = {"team_name": team_name} if team_name else None
 
-                results = self._authorize_dags(
+                results = self._check_dag_authorizations(
                     dag_ids,
                     user=user,
                     method=method_value,
@@ -336,12 +338,6 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         finally:
             with self._dag_warmup_lock:
                 self._dag_warmup_inflight.discard(user_id)
-
-    def _evict_user_dag_cache(self, user_id: str) -> None:
-        with self._dag_permissions_cache_lock:
-            keys_to_delete = [key for key in self._dag_permissions_cache if key[0] == user_id]
-            for key in keys_to_delete:
-                self._dag_permissions_cache.pop(key, None)
 
     def schedule_dag_permission_warmup(
         self,
@@ -363,29 +359,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             if user_id in self._dag_warmup_inflight:
                 return
             self._dag_warmup_inflight.add(user_id)
-            self._pending_role_warmups.discard(user_id)
         self._dag_warmup_executor.submit(self._warmup_user_dag_permissions, user_snapshot, method)
-
-    def notify_role_change(
-        self,
-        *,
-        user: KeycloakAuthManagerUser | None = None,
-        user_id: str | None = None,
-    ) -> None:
-        if user is None and user_id is None:
-            raise ValueError("Either user or user_id must be provided to notify role change")
-
-        if user is None:
-            if user_id is None:
-                raise ValueError("Either user or user_id must be provided to notify role change")
-            resolved_user_id = user_id
-        else:
-            resolved_user_id = str(user.get_id())
-        self._evict_user_dag_cache(resolved_user_id)
-        with self._dag_warmup_lock:
-            self._pending_role_warmups.add(resolved_user_id)
-        if user is not None:
-            self.schedule_dag_permission_warmup(user)
 
     def filter_authorized_dag_ids(
         self,
@@ -399,17 +373,12 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             return set()
 
         user_id = str(user.get_id())
-        with self._dag_warmup_lock:
-            pending_warmup = user_id in self._pending_role_warmups
-        if pending_warmup:
-            self.schedule_dag_permission_warmup(user)
-
         method_value = cast("ExtendedResourceMethod", method)
-        lookup_attributes: dict[str, str | None] | None = {"team_name": team_name} if team_name else None
+        lookup_attributes: OptionalContextAttributes = {"team_name": team_name} if team_name else None
 
         now = monotonic()
         authorized_dags: set[str] = set()
-        dag_ids_to_check: list[tuple[str, tuple[str, str, ExtendedResourceMethod, str | None]]] = []
+        dag_ids_to_check: list[tuple[str, CacheKey]] = []
         for dag_id in dag_ids:
             cache_key = (user_id, dag_id, method_value, team_name)
             cached_permission = self._get_cached_dag_permission(cache_key, now=now)
@@ -421,7 +390,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
         if dag_ids_to_check:
             dag_ids_list = [dag_id for dag_id, _ in dag_ids_to_check]
-            results = self._authorize_dags(
+            results = self._check_dag_authorizations(
                 dag_ids_list,
                 user=user,
                 method=method_value,
@@ -478,14 +447,14 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             method=method, resource_type=KeycloakResource.VARIABLE, user=user, resource_id=variable_key
         )
 
-    def _authorize_dags(
+    def _check_dag_authorizations(
         self,
         dag_ids: Iterable[str],
         *,
         user: KeycloakAuthManagerUser,
         method: ExtendedResourceMethod,
-        attributes: dict[str, str | None] | None = None,
-        log_context: dict[str, str | None] | None = None,
+        attributes: OptionalContextAttributes = None,
+        log_context: OptionalContextAttributes = None,
     ) -> dict[str, bool]:
         dag_list = list(dag_ids)
         if not dag_list:
@@ -606,7 +575,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         resource_type: KeycloakResource,
         user: KeycloakAuthManagerUser,
         resource_id: str | None = None,
-        attributes: dict[str, str | None] | None = None,
+        attributes: OptionalContextAttributes = None,
     ) -> bool:
         client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
@@ -640,7 +609,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         permissions: list[tuple[ExtendedResourceMethod, str]],
         user: KeycloakAuthManagerUser,
-        attributes: dict[str, str | None] | None = None,
+        attributes: OptionalContextAttributes = None,
     ) -> set[tuple[str, str]]:
         client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
@@ -683,7 +652,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def _get_batch_payload(
         client_id: str,
         permissions: list[tuple[ExtendedResourceMethod, str]],
-        attributes: dict[str, str | None] | None = None,
+        attributes: OptionalContextAttributes = None,
     ):
         payload: dict[str, Any] = {
             "grant_type": "urn:ietf:params:oauth:grant-type:uma-ticket",
