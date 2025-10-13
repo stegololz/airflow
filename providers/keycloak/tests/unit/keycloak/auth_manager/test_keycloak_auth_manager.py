@@ -430,12 +430,16 @@ class TestKeycloakAuthManager:
     def test_get_cli_commands_return_cli_commands(self, auth_manager):
         assert len(auth_manager.get_cli_commands()) == 1
 
-    @patch.object(KeycloakAuthManager, "_is_batch_authorized")
+    @patch.object(KeycloakAuthManager, "_check_dag_authorizations")
     def test_filter_authorized_dag_ids_uses_batch_permissions(
-        self, mock_is_batch_authorized, auth_manager, user
+        self, mock_check_authorizations, auth_manager, user
     ):
         dag_ids = {"dag_a", "dag_b", "dag_c"}
-        mock_is_batch_authorized.return_value = {("GET", "dag_a"), ("GET", "dag_c")}
+        mock_check_authorizations.return_value = {
+            "dag_a": True,
+            "dag_b": False,
+            "dag_c": True,
+        }
 
         result = auth_manager.filter_authorized_dag_ids(
             dag_ids=dag_ids,
@@ -445,23 +449,30 @@ class TestKeycloakAuthManager:
         )
 
         assert result == {"dag_a", "dag_c"}
-        assert mock_is_batch_authorized.call_count == 1
-        call_kwargs = mock_is_batch_authorized.call_args.kwargs
+        mock_check_authorizations.assert_called_once()
+        call_args = mock_check_authorizations.call_args
+        dag_ids_arg = call_args.args[0]
+        assert set(dag_ids_arg) == dag_ids
+        call_kwargs = call_args.kwargs
         assert call_kwargs["user"] is user
         assert call_kwargs["attributes"] == {"team_name": "team-blue"}
-        assert set(call_kwargs["permissions"]) == {("GET", "dag_a"), ("GET", "dag_b"), ("GET", "dag_c")}
+        assert call_kwargs["method"] == "GET"
+        assert call_kwargs["log_context"] == {"user_id": str(user.get_id())}
 
-    @patch.object(KeycloakAuthManager, "_is_batch_authorized")
+    @patch.object(KeycloakAuthManager, "_check_dag_authorizations")
     @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.monotonic")
     def test_filter_authorized_dag_ids_uses_cache(
         self,
         mock_monotonic,
-        mock_is_batch_authorized,
+        mock_check_authorizations,
         auth_manager,
         user,
     ):
-        mock_monotonic.side_effect = [1.0, 1.1, 2.0]
-        mock_is_batch_authorized.return_value = {("GET", "dag_a")}
+        mock_monotonic.side_effect = [1.0, 1.1, 2.0, 2.1, 2.2]
+        mock_check_authorizations.side_effect = [
+            {"dag_a": True, "dag_b": False},
+            {"dag_b": False},
+        ]
         auth_manager._dag_permissions_cache_ttl_seconds = 30
 
         dag_ids = {"dag_a", "dag_b"}
@@ -481,21 +492,23 @@ class TestKeycloakAuthManager:
 
         assert first == {"dag_a"}
         assert second == {"dag_a"}
-        assert mock_is_batch_authorized.call_count == 1
+        assert mock_check_authorizations.call_count == 1
+        used_dags = set(mock_check_authorizations.call_args_list[0].args[0])
+        assert used_dags == {"dag_a", "dag_b"}
 
-    @patch.object(KeycloakAuthManager, "_is_batch_authorized")
+    @patch.object(KeycloakAuthManager, "_check_dag_authorizations")
     @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.monotonic")
     def test_filter_authorized_dag_ids_cache_expires(
         self,
         mock_monotonic,
-        mock_is_batch_authorized,
+        mock_check_authorizations,
         auth_manager,
         user,
     ):
-        mock_monotonic.side_effect = [1.0, 1.1, 10.0, 10.1]
-        mock_is_batch_authorized.side_effect = [
-            {("GET", "dag_a")},
-            {("GET", "dag_a")},
+        mock_monotonic.side_effect = [1.0, 1.1, 10.0, 10.1, 10.2]
+        mock_check_authorizations.side_effect = [
+            {"dag_a": True},
+            {"dag_a": True},
         ]
         auth_manager._dag_permissions_cache_ttl_seconds = 5
 
@@ -516,7 +529,7 @@ class TestKeycloakAuthManager:
 
         assert first == {"dag_a"}
         assert second == {"dag_a"}
-        assert mock_is_batch_authorized.call_count == 2
+        assert mock_check_authorizations.call_count == 2
 
     def test_schedule_dag_permission_warmup_submits_task(self, auth_manager, user):
         auth_manager._dag_permissions_cache_ttl_seconds = 30
