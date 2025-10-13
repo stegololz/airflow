@@ -22,6 +22,7 @@ import logging
 import threading
 import weakref
 from collections import defaultdict
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import monotonic
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -319,34 +320,17 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
                     continue
                 attributes: dict[str, str | None] | None = {"team_name": team_name} if team_name else None
 
-                max_workers = min(self._authorization_parallelism, len(dag_ids))
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            self._is_authorized,
-                            method=method_value,
-                            resource_type=KeycloakResource.DAG,
-                            user=user,
-                            resource_id=dag_id,
-                            attributes=attributes,
-                        ): dag_id
-                        for dag_id in dag_ids
-                    }
-                    for future in as_completed(futures):
-                        dag_id = futures[future]
-                        try:
-                            allowed = future.result()
-                        except Exception:
-                            log.exception(
-                                "Failed to warm DAG permissions for user %s and dag %s (team %s)",
-                                user_id,
-                                dag_id,
-                                team_name,
-                            )
-                            continue
-
-                        cache_key = (user_id, dag_id, method_value, team_name)
-                        self._set_cached_dag_permission(cache_key, allowed, now=monotonic())
+                results = self._authorize_dags(
+                    dag_ids,
+                    user=user,
+                    method=method_value,
+                    attributes=attributes,
+                    log_context={"team": team_name},
+                )
+                cache_time = monotonic()
+                for dag_id, allowed in results.items():
+                    cache_key = (user_id, dag_id, method_value, team_name)
+                    self._set_cached_dag_permission(cache_key, allowed, now=cache_time)
         except Exception:
             log.exception("Failed to warm DAG permissions for user %s", user_id)
         finally:
@@ -436,30 +420,22 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
                 authorized_dags.add(dag_id)
 
         if dag_ids_to_check:
-            max_workers = min(self._authorization_parallelism, len(dag_ids_to_check))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        self._is_authorized,
-                        method=method_value,
-                        resource_type=KeycloakResource.DAG,
-                        user=user,
-                        resource_id=dag_id,
-                        attributes=lookup_attributes,
-                    ): (dag_id, cache_key)
-                    for dag_id, cache_key in dag_ids_to_check
-                }
-                for future in as_completed(futures):
-                    dag_id, cache_key = futures[future]
-                    try:
-                        is_authorized = future.result()
-                    except Exception:
-                        log.exception("Failed to authorize dag %s for user %s", dag_id, user_id)
-                        continue
-
-                    if is_authorized:
-                        authorized_dags.add(dag_id)
-                    self._set_cached_dag_permission(cache_key, is_authorized, now=monotonic())
+            dag_ids_list = [dag_id for dag_id, _ in dag_ids_to_check]
+            results = self._authorize_dags(
+                dag_ids_list,
+                user=user,
+                method=method_value,
+                attributes=lookup_attributes,
+                log_context={"user_id": user_id},
+            )
+            cache_time = monotonic()
+            for dag_id, cache_key in dag_ids_to_check:
+                is_authorized = results.get(dag_id)
+                if is_authorized is None:
+                    continue
+                if is_authorized:
+                    authorized_dags.add(dag_id)
+                self._set_cached_dag_permission(cache_key, is_authorized, now=cache_time)
 
         return authorized_dags
 
@@ -501,6 +477,53 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         return self._is_authorized(
             method=method, resource_type=KeycloakResource.VARIABLE, user=user, resource_id=variable_key
         )
+
+    def _authorize_dags(
+        self,
+        dag_ids: Iterable[str],
+        *,
+        user: KeycloakAuthManagerUser,
+        method: ExtendedResourceMethod,
+        attributes: dict[str, str | None] | None = None,
+        log_context: dict[str, str | None] | None = None,
+    ) -> dict[str, bool]:
+        dag_list = list(dag_ids)
+        if not dag_list:
+            return {}
+
+        max_workers = min(self._authorization_parallelism, len(dag_list))
+        if max_workers <= 0:
+            max_workers = 1
+
+        user_id = str(user.get_id())
+        context_suffix = ""
+        if log_context:
+            decorated = [f"{key}={value}" for key, value in log_context.items() if value is not None]
+            if decorated:
+                context_suffix = f" ({', '.join(decorated)})"
+
+        results: dict[str, bool] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._is_authorized,
+                    method=method,
+                    resource_type=KeycloakResource.DAG,
+                    user=user,
+                    resource_id=dag_id,
+                    attributes=attributes,
+                ): dag_id
+                for dag_id in dag_list
+            }
+
+            for future in as_completed(futures):
+                dag_id = futures[future]
+                try:
+                    results[dag_id] = future.result()
+                except Exception:
+                    log.exception("Failed to authorize dag %s for user %s%s", dag_id, user_id, context_suffix)
+
+        return results
 
     def is_authorized_pool(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: PoolDetails | None = None
