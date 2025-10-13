@@ -140,6 +140,9 @@ class TestLoginRouter:
         mock_sec_get_auth_manager.return_value = mock_auth_manager_sec
         mock_auth_manager_sec.get_user_from_token = AsyncMock(return_value=mock_user)
 
+        mock_auth_manager = Mock()
+        mock_get_auth_manager.return_value = mock_auth_manager
+
         next_url = "http://localhost:8080"
         response = client.get(
             AUTH_MANAGER_FASTAPI_APP_PREFIX + "/refresh",
