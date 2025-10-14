@@ -96,7 +96,13 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def __init__(self) -> None:
         super().__init__()
         self._dag_cache = KeycloakDagPermissionCache(
-            permission_resolver=self._authorize_dag,
+            permission_resolver=lambda method, user, dag_id, attributes: self._is_authorized(
+                method=method,
+                resource_type=KeycloakResource.DAG,
+                user=user,
+                resource_id=dag_id,
+                attributes=attributes,
+            ),
         )
 
     def init(self) -> None:
@@ -250,21 +256,6 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         variable_key = details.key if details else None
         return self._is_authorized(
             method=method, resource_type=KeycloakResource.VARIABLE, user=user, resource_id=variable_key
-        )
-
-    def _authorize_dag(
-        self,
-        method: ExtendedResourceMethod,
-        user: KeycloakAuthManagerUser,
-        dag_id: str,
-        attributes: OptionalContextAttributes = None,
-    ) -> bool:
-        return self._is_authorized(
-            method=method,
-            resource_type=KeycloakResource.DAG,
-            user=user,
-            resource_id=dag_id,
-            attributes=attributes,
         )
 
     def is_authorized_pool(
