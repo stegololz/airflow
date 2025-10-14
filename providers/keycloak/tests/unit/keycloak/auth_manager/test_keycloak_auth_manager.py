@@ -430,23 +430,23 @@ class TestKeycloakAuthManager:
     def test_get_cli_commands_return_cli_commands(self, auth_manager):
         assert len(auth_manager.get_cli_commands()) == 1
 
-    @patch.object(KeycloakAuthManager, "_check_dag_authorizations")
-    def test_filter_authorized_dag_ids_uses_batch_permissions(
-        self, mock_check_authorizations, auth_manager, user
-    ):
+    def test_filter_authorized_dag_ids_uses_batch_permissions(self, auth_manager, user):
         dag_ids = {"dag_a", "dag_b", "dag_c"}
-        mock_check_authorizations.return_value = {
-            "dag_a": True,
-            "dag_b": False,
-            "dag_c": True,
-        }
-
-        result = auth_manager.filter_authorized_dag_ids(
-            dag_ids=dag_ids,
-            user=user,
-            method="GET",
-            team_name="team-blue",
-        )
+        with patch.object(
+            auth_manager._dag_cache,
+            "_check_dag_authorizations",
+            return_value={
+                "dag_a": True,
+                "dag_b": False,
+                "dag_c": True,
+            },
+        ) as mock_check_authorizations:
+            result = auth_manager.filter_authorized_dag_ids(
+                dag_ids=dag_ids,
+                user=user,
+                method="GET",
+                team_name="team-blue",
+            )
 
         assert result == {"dag_a", "dag_c"}
         mock_check_authorizations.assert_called_once()
@@ -459,97 +459,37 @@ class TestKeycloakAuthManager:
         assert call_kwargs["method"] == "GET"
         assert call_kwargs["log_context"] == {"user_id": str(user.get_id())}
 
-    @patch.object(KeycloakAuthManager, "_check_dag_authorizations")
-    @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.monotonic")
-    def test_filter_authorized_dag_ids_uses_cache(
-        self,
-        mock_monotonic,
-        mock_check_authorizations,
-        auth_manager,
-        user,
-    ):
-        mock_monotonic.side_effect = [1.0, 1.1, 2.0, 2.1, 2.2]
-        mock_check_authorizations.side_effect = [
-            {"dag_a": True, "dag_b": False},
-            {"dag_b": False},
-        ]
-        auth_manager._dag_permissions_cache_ttl_seconds = 30
+    def test_filter_authorized_dag_ids_delegates_to_cache(self, auth_manager, user):
+        with patch.object(
+            auth_manager._dag_cache, "filter_authorized_dag_ids", return_value={"dag_a"}
+        ) as mock_filter:
+            result = auth_manager.filter_authorized_dag_ids(
+                dag_ids={"dag_a", "dag_b"},
+                user=user,
+                method="GET",
+                team_name=None,
+            )
 
-        dag_ids = {"dag_a", "dag_b"}
-
-        first = auth_manager.filter_authorized_dag_ids(
-            dag_ids=dag_ids,
-            user=user,
-            method="GET",
-            team_name=None,
-        )
-        second = auth_manager.filter_authorized_dag_ids(
-            dag_ids=dag_ids,
+        assert result == {"dag_a"}
+        mock_filter.assert_called_once_with(
+            dag_ids={"dag_a", "dag_b"},
             user=user,
             method="GET",
             team_name=None,
         )
 
-        assert first == {"dag_a"}
-        assert second == {"dag_a"}
-        assert mock_check_authorizations.call_count == 1
-        used_dags = set(mock_check_authorizations.call_args_list[0].args[0])
-        assert used_dags == {"dag_a", "dag_b"}
+    def test_schedule_dag_permission_warmup_delegates_to_cache(self, auth_manager, user):
+        with patch.object(auth_manager._dag_cache, "schedule_dag_permission_warmup") as mock_schedule:
+            auth_manager.schedule_dag_permission_warmup(user, method="POST")
 
-    @patch.object(KeycloakAuthManager, "_check_dag_authorizations")
-    @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.monotonic")
-    def test_filter_authorized_dag_ids_cache_expires(
-        self,
-        mock_monotonic,
-        mock_check_authorizations,
-        auth_manager,
-        user,
-    ):
-        mock_monotonic.side_effect = [1.0, 1.1, 10.0, 10.1, 10.2]
-        mock_check_authorizations.side_effect = [
-            {"dag_a": True},
-            {"dag_a": True},
-        ]
-        auth_manager._dag_permissions_cache_ttl_seconds = 5
+        mock_schedule.assert_called_once()
+        args, kwargs = mock_schedule.call_args
+        assert args[0].get_id() == str(user.get_id())
+        assert kwargs["method"] == "POST"
 
-        dag_ids = {"dag_a"}
+    def test_schedule_dag_permission_warmup_skipped_when_disabled(self, auth_manager, user):
+        auth_manager._dag_cache._permissions_cache_ttl_seconds = 0
+        with patch.object(auth_manager._dag_cache, "schedule_dag_permission_warmup") as mock_schedule:
+            auth_manager.schedule_dag_permission_warmup(user)
 
-        first = auth_manager.filter_authorized_dag_ids(
-            dag_ids=dag_ids,
-            user=user,
-            method="GET",
-            team_name=None,
-        )
-        second = auth_manager.filter_authorized_dag_ids(
-            dag_ids=dag_ids,
-            user=user,
-            method="GET",
-            team_name=None,
-        )
-
-        assert first == {"dag_a"}
-        assert second == {"dag_a"}
-        assert mock_check_authorizations.call_count == 2
-
-    def test_schedule_dag_permission_warmup_submits_task(self, auth_manager, user):
-        auth_manager._dag_permissions_cache_ttl_seconds = 30
-        submit_mock = Mock()
-        auth_manager._dag_warmup_executor.submit = submit_mock
-
-        auth_manager.schedule_dag_permission_warmup(user)
-        auth_manager.schedule_dag_permission_warmup(user)
-
-        submit_mock.assert_called_once()
-        scheduled_callable, scheduled_user, scheduled_method = submit_mock.call_args.args
-        assert scheduled_callable == auth_manager._warmup_user_dag_permissions
-        assert scheduled_user.get_id() == user.get_id()
-        assert scheduled_method == "GET"
-
-    def test_schedule_dag_permission_warmup_skipped_when_ttl_disabled(self, auth_manager, user):
-        auth_manager._dag_permissions_cache_ttl_seconds = 0
-        submit_mock = Mock()
-        auth_manager._dag_warmup_executor.submit = submit_mock
-
-        auth_manager.schedule_dag_permission_warmup(user)
-
-        submit_mock.assert_not_called()
+        mock_schedule.assert_not_called()
