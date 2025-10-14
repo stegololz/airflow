@@ -291,6 +291,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         team_model_cls: type[Any] | None
         team_assoc_table: Any | None
         try:
+            # Lazy import: Team models exist only in newer Airflow releases
             from airflow.models.team import (
                 Team as team_model_cls_runtime,
                 dag_bundle_team_association_table as team_assoc_table_runtime,
