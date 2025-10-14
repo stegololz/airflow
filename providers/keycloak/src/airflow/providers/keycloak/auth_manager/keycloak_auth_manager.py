@@ -47,7 +47,6 @@ from airflow.configuration import conf
 from airflow.exceptions import AirflowException
 from airflow.models import DagModel
 from airflow.models.dagbundle import DagBundleModel
-from airflow.models.team import Team, dag_bundle_team_association_table
 from airflow.providers.keycloak.auth_manager.cli.definition import KEYCLOAK_AUTH_MANAGER_COMMANDS
 from airflow.providers.keycloak.auth_manager.constants import (
     CONF_AUTHORIZATION_PARALLELISM_KEY,
@@ -289,15 +288,38 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     @staticmethod
     @provide_session
     def _fetch_dag_inventory(*, session: Session = NEW_SESSION) -> dict[str | None, set[str]]:
+        team_model_cls: type[Any] | None
+        team_assoc_table: Any | None
+        try:
+            from airflow.models.team import (
+                Team as team_model_cls_runtime,
+                dag_bundle_team_association_table as team_assoc_table_runtime,
+            )
+        except ModuleNotFoundError:
+            team_model_cls = None
+            team_assoc_table = None
+        else:
+            team_model_cls = team_model_cls_runtime
+            team_assoc_table = team_assoc_table_runtime
+
+        if team_model_cls is None or team_assoc_table is None:
+            stmt = select(DagModel.dag_id)
+            dag_ids = session.execute(stmt).scalars().all()
+            return {None: set(dag_ids)}
+
         stmt = (
-            select(DagModel.dag_id, Team.name)
+            select(DagModel.dag_id, team_model_cls.name)
             .join(DagBundleModel, DagModel.bundle_name == DagBundleModel.name)
             .join(
-                dag_bundle_team_association_table,
-                DagBundleModel.name == dag_bundle_team_association_table.c.dag_bundle_name,
+                team_assoc_table,
+                DagBundleModel.name == team_assoc_table.c.dag_bundle_name,
                 isouter=True,
             )
-            .join(Team, Team.id == dag_bundle_team_association_table.c.team_id, isouter=True)
+            .join(
+                team_model_cls,
+                team_model_cls.id == team_assoc_table.c.team_id,
+                isouter=True,
+            )
         )
         rows = session.execute(stmt).all()
         dags_by_team: dict[str | None, set[str]] = defaultdict(set)
