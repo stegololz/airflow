@@ -31,8 +31,8 @@ They can create the permissions and needed resources easily.
 
 There are two options to create the permissions:
 
-* Create all permissions (Scopes, Resources, Permissions) in one go using one CLI command
-* Create all permissions (Scopes, Resources, Permissions) step-by-step using the CLI commands
+* Create all permissions (Scopes, Resources, Permissions and Policies) in one go using one CLI command
+* Create all permissions (Scopes, Resources, Permissions and Policies) step-by-step using the CLI commands
 
 CLI commands take the following parameters:
 
@@ -48,7 +48,7 @@ One-go creation of permissions
 
 There is a single command do all the magic for you.
 
-This command will create scopes, resources and permissions in one-go.
+This command will create scopes, resources, permissions and policies in one-go.
 
 .. code-block:: bash
 
@@ -83,6 +83,17 @@ This will create
 * admin permissions
 * user permissions
 * operations permissions
+
+Lastly, install the policy that enables batch DAG authorization decisions in Keycloak:
+
+.. code-block:: bash
+
+  airflow keycloak-auth-manager create-policies
+
+The command installs ``DagVisibilityPolicy`` using the source at
+``airflow/providers/keycloak/auth_manager/policies/dag_visibility.js``. Grant access by
+populating the user attribute ``airflow_dag_allow`` with comma-separated DAG identifiers; the
+policy returns only the ids listed there.
 
 More resources about permissions can be found in the official documentation of Keycloak:
 

@@ -38,11 +38,6 @@ from airflow.api_fastapi.common.types import MenuItem
 from airflow.cli.cli_config import CLICommand, DefaultHelpParser, GroupCommand
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException
-from airflow.providers.keycloak.auth_manager.cache import (
-    ContextAttributes,
-    KeycloakDagPermissionCache,
-    OptionalContextAttributes,
-)
 from airflow.providers.keycloak.auth_manager.cli.definition import KEYCLOAK_AUTH_MANAGER_COMMANDS
 from airflow.providers.keycloak.auth_manager.constants import (
     CONF_CLIENT_ID_KEY,
@@ -70,9 +65,14 @@ if TYPE_CHECKING:
         VariableDetails,
     )
 
+ContextAttributes = dict[str, str | None]
+OptionalContextAttributes = ContextAttributes | None
+
 log = logging.getLogger(__name__)
 
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
+DAG_IDS_ATTRIBUTE_NAME = "dag_ids"
+DAG_IDS_ATTRIBUTE_SEPARATOR = ","
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -95,19 +95,6 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._dag_cache = KeycloakDagPermissionCache(
-            permission_resolver=lambda method, user, dag_id, attributes: self._is_authorized(
-                method=method,
-                resource_type=KeycloakResource.DAG,
-                user=user,
-                resource_id=dag_id,
-                attributes=attributes,
-            ),
-        )
-
-    def init(self) -> None:
-        super().init()
-        self._dag_cache.init()
 
     def deserialize_user(self, token: dict[str, Any]) -> KeycloakAuthManagerUser:
         return KeycloakAuthManagerUser(
@@ -188,20 +175,8 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         method: ResourceMethod = "GET",
     ) -> None:
-        method_value = cast("ExtendedResourceMethod", method)
-        if not self._dag_cache.permissions_cache_enabled:
-            return
-
-        user_snapshot = KeycloakAuthManagerUser(
-            user_id=str(user.get_id()),
-            name=str(user.get_name()),
-            access_token=getattr(user, "access_token", ""),
-            refresh_token=getattr(user, "refresh_token", ""),
-        )
-        self._dag_cache.schedule_dag_permission_warmup(
-            user_snapshot,
-            method=method_value,
-        )
+        # No-op: warmup only applied when cache-based authorization was in place.
+        self.log.debug("Skipping DAG permission warmup for user %s; no cache configured.", user.get_id())
 
     def filter_authorized_dag_ids(
         self,
@@ -212,12 +187,21 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         team_name: str | None = None,
     ) -> set[str]:
         method_value = cast("ExtendedResourceMethod", method)
-        return self._dag_cache.filter_authorized_dag_ids(
-            dag_ids=dag_ids,
+        if not dag_ids:
+            return set()
+
+        attributes: ContextAttributes = {
+            DAG_IDS_ATTRIBUTE_NAME: DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(dag_ids)),
+        }
+        if team_name:
+            attributes["team_name"] = team_name
+
+        permissions = self._is_batch_authorized(
+            permissions=[(method_value, KeycloakResource.DAG.value)],
             user=user,
-            method=method_value,
-            team_name=team_name,
+            attributes=attributes,
         )
+        return self._extract_authorized_dag_ids(permissions, dag_ids)
 
     def is_authorized_backfill(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: BackfillDetails | None = None
@@ -288,7 +272,12 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             permissions=[("MENU", menu_item.value) for menu_item in menu_items],
             user=user,
         )
-        return [MenuItem(menu[1]) for menu in authorized_menus]
+        target_values = {menu_item.value for menu_item in menu_items}
+        return [
+            MenuItem(permission["rsname"])
+            for permission in authorized_menus
+            if permission.get("rsname") in target_values
+        ]
 
     def get_fastapi_app(self) -> FastAPI | None:
         from airflow.providers.keycloak.auth_manager.routes.login import login_router
@@ -374,7 +363,7 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         permissions: list[tuple[ExtendedResourceMethod, str]],
         user: KeycloakAuthManagerUser,
         attributes: OptionalContextAttributes = None,
-    ) -> set[tuple[str, str]]:
+    ) -> list[dict[str, Any]]:
         client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
         server_url = conf.get(CONF_SECTION_NAME, CONF_SERVER_URL_KEY)
@@ -386,15 +375,48 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         )
 
         if resp.status_code == 200:
-            return {(perm["scopes"][0], perm["rsname"]) for perm in resp.json()}
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            return []
         if resp.status_code == 403:
-            return set()
+            return []
         if resp.status_code == 400:
             error = json.loads(resp.text)
             raise AirflowException(
                 f"Request not recognized by Keycloak. {error.get('error')}. {error.get('error_description')}"
             )
         raise AirflowException(f"Unexpected error: {resp.status_code} - {resp.text}")
+
+    def _extract_authorized_dag_ids(
+        self,
+        permissions: list[dict[str, Any]],
+        requested_dag_ids: set[str],
+    ) -> set[str]:
+        """
+        Extract DAG ids from UMA permission responses.
+
+        The Keycloak policy should emit the DAG ids as individual scopes on the granted permission entries.
+        """
+        if not permissions:
+            return set()
+
+        authorized: set[str] = set()
+        for permission in permissions:
+            scopes = permission.get("scopes") or []
+            for scope in scopes:
+                if scope in requested_dag_ids:
+                    authorized.add(scope)
+
+            resource_name = permission.get("rsname")
+            if resource_name and resource_name in requested_dag_ids:
+                authorized.add(resource_name)
+
+            resource_id = permission.get("rsid")
+            if resource_id and resource_id in requested_dag_ids:
+                authorized.add(resource_id)
+
+        return authorized
 
     @staticmethod
     def _get_token_url(server_url, realm):

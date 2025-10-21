@@ -14,12 +14,3 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-# Configuration keys
-from __future__ import annotations
-
-CONF_SECTION_NAME = "keycloak_auth_manager"
-CONF_CLIENT_ID_KEY = "client_id"
-CONF_CLIENT_SECRET_KEY = "client_secret"
-CONF_REALM_KEY = "realm"
-CONF_SERVER_URL_KEY = "server_url"
