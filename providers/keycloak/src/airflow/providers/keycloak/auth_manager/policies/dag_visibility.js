@@ -49,76 +49,61 @@
 var context = $evaluation.getContext();
 var attributes = context.getAttributes();
 
-var dagIdsAttr = attributes.getValue("dag_ids");
-if (!dagIdsAttr || dagIdsAttr.isEmpty()) {
-    $evaluation.deny();
-    quit();
-}
-
-var dagIds = dagIdsAttr.get(0).split(/\s*,\s*/);
-
-var identity = context.getIdentity();
-
-var teamNameAttr = attributes.getValue("team_name");
-var teamName = teamNameAttr && !teamNameAttr.isEmpty() ? teamNameAttr.get(0) : null;
-
-var ALLOW_ATTRIBUTE = "airflow_dag_allow";
-var allowedIds = collectAllowedIds(identity);
-
-function collectAllowedIds(user) {
-    var attrValues = user.getAttributes().getValue(ALLOW_ATTRIBUTE);
-    if (!attrValues || attrValues.isEmpty()) {
-        return [];
+(function () {
+    var dagIdsAttr = attributes.getValue("dag_ids");
+    if (!dagIdsAttr || dagIdsAttr.isEmpty()) {
+        $evaluation.grant();
+        return;
     }
-    var aggregated = "";
-    for (var i = 0; i < attrValues.size(); i++) {
-        var value = attrValues.get(i);
-        if (value) {
-            if (aggregated.length > 0) {
-                aggregated += ",";
+
+    var dagIds = dagIdsAttr.get(0).split(/\s*,\s*/);
+
+    var allowedAttr = attributes.getValue("allowed_dags");
+    var allowAll = false;
+    var allowedIds = [];
+    if (!allowedAttr || allowedAttr.isEmpty()) {
+        allowAll = true;
+    } else {
+        var allowedRaw = allowedAttr.get(0);
+        if (allowedRaw === "*") {
+            allowAll = true;
+        } else if (allowedRaw) {
+            var entries = allowedRaw.split(/\s*,\s*/);
+            for (var idx = 0; idx < entries.length; idx++) {
+                if (entries[idx]) {
+                    allowedIds.push(entries[idx]);
+                }
             }
-            aggregated += value;
         }
     }
-    if (!aggregated) {
-        return [];
-    }
-    var entries = aggregated.split(/\s*,\s*/);
-    var clean = [];
-    for (var j = 0; j < entries.length; j++) {
-        if (entries[j]) {
-            clean.push(entries[j]);
+
+    var permission = $evaluation.getPermission();
+    var granted = false;
+
+    for (var i = 0; i < dagIds.length; i++) {
+        var dagId = dagIds[i];
+        if (!dagId) {
+            continue;
+        }
+
+        if (allowAll) {
+            permission.addScope(dagId);
+            granted = true;
+            continue;
+        }
+
+        for (var j = 0; j < allowedIds.length; j++) {
+            if (allowedIds[j] === dagId) {
+                permission.addScope(dagId);
+                granted = true;
+                break;
+            }
         }
     }
-    return clean;
-}
 
-function isDagAllowedForUser(dagId, user, team) {
-    for (var i = 0; i < allowedIds.length; i++) {
-        if (allowedIds[i] === dagId) {
-            return true;
-        }
+    if (granted) {
+        $evaluation.grant();
+    } else {
+        $evaluation.deny();
     }
-    return false;
-}
-
-var permission = $evaluation.getPermission();
-var granted = false;
-
-for (var i = 0; i < dagIds.length; i++) {
-    var dagId = dagIds[i];
-    if (!dagId) {
-        continue;
-    }
-
-    if (isDagAllowedForUser(dagId, identity, teamName)) {
-        permission.addScope(dagId);
-        granted = true;
-    }
-}
-
-if (granted) {
-    $evaluation.grant();
-} else {
-    $evaluation.deny();
-}
+})();

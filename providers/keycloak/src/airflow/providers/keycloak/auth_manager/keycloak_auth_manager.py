@@ -21,6 +21,7 @@ import json
 import logging
 import time
 from base64 import urlsafe_b64decode
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin
 
@@ -49,6 +50,7 @@ from airflow.providers.keycloak.auth_manager.constants import (
     CONF_SERVER_URL_KEY,
 )
 from airflow.providers.keycloak.auth_manager.resources import KeycloakResource
+from airflow.providers.keycloak.auth_manager.services.dag_visibility import resolve_allowed_dags
 from airflow.providers.keycloak.auth_manager.user import KeycloakAuthManagerUser
 from airflow.utils.helpers import prune_dict
 
@@ -75,6 +77,16 @@ log = logging.getLogger(__name__)
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
 DAG_IDS_ATTRIBUTE_NAME = "dag_ids"
 DAG_IDS_ATTRIBUTE_SEPARATOR = ","
+
+
+def _summarize(values: Iterable[str], *, limit: int = 5) -> str:
+    items = [value for value in values if value]
+    if not items:
+        return "-"
+    items.sort()
+    sample = items[:limit]
+    suffix = ", ..." if len(items) > limit else ""
+    return ", ".join(sample) + suffix
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -190,13 +202,35 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         }
         if team_name:
             attributes["team_name"] = team_name
+        allowed_dags = resolve_allowed_dags(user.get_id(), team_name)
+        attributes["allowed_dags"] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(allowed_dags or []))
+
+        if log.isEnabledFor(logging.INFO):
+            log.info(
+                "Keycloak DAG visibility request user=%s team=%s count=%d sample=[%s]",
+                user.get_id(),
+                team_name or "-",
+                len(dag_ids),
+                _summarize(dag_ids),
+            )
 
         permissions = self._is_batch_authorized(
             permissions=[(method_value, KeycloakResource.DAG.value)],
             user=user,
             attributes=attributes,
         )
-        return self._extract_authorized_dag_ids(permissions, dag_ids)
+        authorized = self._extract_authorized_dag_ids(permissions, dag_ids)
+
+        if log.isEnabledFor(logging.INFO):
+            log.info(
+                "Keycloak DAG visibility grant user=%s team=%s count=%d sample=[%s]",
+                user.get_id(),
+                team_name or "-",
+                len(authorized),
+                _summarize(authorized),
+            )
+
+        return authorized
 
     def is_authorized_backfill(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: BackfillDetails | None = None
@@ -335,6 +369,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         elif method == "GET":
             method = "LIST"
 
+        if resource_type == KeycloakResource.DAG:
+            allowed_dags = resolve_allowed_dags(user.get_id(), context_attributes.get("team_name"))
+            context_attributes["allowed_dags"] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(allowed_dags or []))
+
         resp = requests.post(
             self._get_token_url(server_url, realm),
             data=self._get_payload(client_id, f"{resource_type.value}#{method}", context_attributes),
@@ -363,9 +401,24 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
         server_url = conf.get(CONF_SECTION_NAME, CONF_SERVER_URL_KEY)
 
+        context_attributes = prune_dict(attributes or {}) if attributes else None
+
+        if (
+            log.isEnabledFor(logging.DEBUG)
+            and context_attributes
+            and context_attributes.get(DAG_IDS_ATTRIBUTE_NAME)
+        ):
+            dag_ids_preview = context_attributes[DAG_IDS_ATTRIBUTE_NAME]
+            log.debug(
+                "Submitting UMA batch request dag_ids=%s team=%s allowed=%s",
+                dag_ids_preview,
+                context_attributes.get("team_name"),
+                context_attributes.get("allowed_dags"),
+            )
+
         resp = requests.post(
             self._get_token_url(server_url, realm),
-            data=self._get_batch_payload(client_id, permissions),
+            data=self._get_batch_payload(client_id, permissions, context_attributes),
             headers=self._get_headers(user.access_token),
         )
 
@@ -375,6 +428,8 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
                 return data
             return []
         if resp.status_code == 403:
+            if context_attributes and context_attributes.get(DAG_IDS_ATTRIBUTE_NAME):
+                log.warning("Keycloak denied DAG visibility request with 403 response.")
             return []
         if resp.status_code == 400:
             error = json.loads(resp.text)
@@ -430,13 +485,19 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         return payload
 
     @staticmethod
-    def _get_batch_payload(client_id: str, permissions: list[tuple[ExtendedResourceMethod, str]]):
+    def _get_batch_payload(
+        client_id: str,
+        permissions: list[tuple[ExtendedResourceMethod, str]],
+        attributes: dict[str, str] | None = None,
+    ):
         payload: dict[str, Any] = {
             "grant_type": "urn:ietf:params:oauth:grant-type:uma-ticket",
             "audience": client_id,
             "permission": [f"{permission[1]}#{permission[0]}" for permission in permissions],
             "response_mode": "permissions",
         }
+        if attributes:
+            payload["context"] = {"attributes": attributes}
 
         return payload
 

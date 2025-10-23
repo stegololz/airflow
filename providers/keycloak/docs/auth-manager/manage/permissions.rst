@@ -84,16 +84,15 @@ This will create
 * user permissions
 * operations permissions
 
-Lastly, install the policy that enables batch DAG authorization decisions in Keycloak:
-
-.. code-block:: bash
-
-  airflow keycloak-auth-manager create-policies
-
-The command installs ``DagVisibilityPolicy`` using the source at
-``airflow/providers/keycloak/auth_manager/policies/dag_visibility.js``. Grant access by
-populating the user attribute ``airflow_dag_allow`` with comma-separated DAG identifiers; the
-policy returns only the ids listed there.
+Run ``files/scripts/register_keycloak_base.sh`` to create the base client roles
+(``admin``, ``viewer``, ``user``, ``op``), their associated ``Allow-*`` policies, and the
+default resource permissions referenced above. After that, execute
+``files/scripts/register_keycloak_policy.sh`` to upload the DAG visibility policy JAR and
+wire ``DagVisibilityPolicy`` to the ``DagVisibilityPermission`` entry. Airflow computes the
+list of DAG ids to request on behalf of a user in
+``resolve_allowed_dags`` (see
+``airflow/providers/keycloak/auth_manager/services/dag_visibility.py``); replace the stub
+there with logic that fits your environment.
 
 More resources about permissions can be found in the official documentation of Keycloak:
 
