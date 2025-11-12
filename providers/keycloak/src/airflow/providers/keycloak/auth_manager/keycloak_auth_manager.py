@@ -21,7 +21,7 @@ import json
 import logging
 import time
 from base64 import urlsafe_b64decode
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin
 
@@ -50,7 +50,6 @@ from airflow.providers.keycloak.auth_manager.constants import (
     CONF_SERVER_URL_KEY,
 )
 from airflow.providers.keycloak.auth_manager.resources import KeycloakResource
-from airflow.providers.keycloak.auth_manager.services.dag_visibility import resolve_allowed_dags
 from airflow.providers.keycloak.auth_manager.user import KeycloakAuthManagerUser
 from airflow.utils.helpers import prune_dict
 
@@ -145,6 +144,32 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
         return None
 
+    def _authorize_resource_from_details(
+        self,
+        *,
+        method: ResourceMethod | str,
+        user: KeycloakAuthManagerUser,
+        resource_type: KeycloakResource,
+        details: Any | None = None,
+        detail_attr: str | None = None,
+        transform: Callable[[Any], str] | None = None,
+        attributes: dict[str, str | None] | None = None,
+    ) -> bool:
+        """Pull the desired resource-id from ``details`` (when provided) and proxy to ``_is_authorized``."""
+        resource_id = None
+        if details and detail_attr:
+            value = getattr(details, detail_attr, None)
+            if value is not None:
+                resource_id = transform(value) if transform else value
+
+        return self._is_authorized(
+            method=method,
+            resource_type=resource_type,
+            user=user,
+            resource_id=resource_id,
+            attributes=attributes,
+        )
+
     def is_authorized_configuration(
         self,
         *,
@@ -152,12 +177,12 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         user: KeycloakAuthManagerUser,
         details: ConfigurationDetails | None = None,
     ) -> bool:
-        config_section = details.section if details else None
-        return self._is_authorized(
+        return self._authorize_resource_from_details(
             method=method,
-            resource_type=KeycloakResource.CONFIGURATION,
             user=user,
-            resource_id=config_section,
+            resource_type=KeycloakResource.CONFIGURATION,
+            details=details,
+            detail_attr="section",
         )
 
     def is_authorized_connection(
@@ -167,9 +192,12 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         user: KeycloakAuthManagerUser,
         details: ConnectionDetails | None = None,
     ) -> bool:
-        connection_id = details.conn_id if details else None
-        return self._is_authorized(
-            method=method, resource_type=KeycloakResource.CONNECTION, user=user, resource_id=connection_id
+        return self._authorize_resource_from_details(
+            method=method,
+            user=user,
+            resource_type=KeycloakResource.CONNECTION,
+            details=details,
+            detail_attr="conn_id",
         )
 
     def is_authorized_dag(
@@ -202,17 +230,14 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         if not dag_ids:
             return set()
 
-        attributes: ContextAttributes = {
-            DAG_IDS_ATTRIBUTE_NAME: DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(dag_ids)),
-        }
+        attributes: ContextAttributes = {}
         if team_name:
             attributes["team_name"] = team_name
-        allowed_dags = resolve_allowed_dags(user.get_id(), team_name)
-        attributes["allowed_dags"] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(allowed_dags or []))
+        attributes[DAG_IDS_ATTRIBUTE_NAME] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(dag_ids))
 
         if log.isEnabledFor(logging.INFO):
             log.info(
-                "Keycloak DAG visibility request user=%s team=%s count=%d sample=[%s]",
+                "Keycloak DAG visibility request user=%s team=%s requested=%d sample=[%s]",
                 user.get_id(),
                 team_name or "-",
                 len(dag_ids),
@@ -240,17 +265,24 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     def is_authorized_backfill(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: BackfillDetails | None = None
     ) -> bool:
-        backfill_id = str(details.id) if details else None
-        return self._is_authorized(
-            method=method, resource_type=KeycloakResource.BACKFILL, user=user, resource_id=backfill_id
+        return self._authorize_resource_from_details(
+            method=method,
+            user=user,
+            resource_type=KeycloakResource.BACKFILL,
+            details=details,
+            detail_attr="id",
+            transform=str,
         )
 
     def is_authorized_asset(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: AssetDetails | None = None
     ) -> bool:
-        asset_id = details.id if details else None
-        return self._is_authorized(
-            method=method, resource_type=KeycloakResource.ASSET, user=user, resource_id=asset_id
+        return self._authorize_resource_from_details(
+            method=method,
+            user=user,
+            resource_type=KeycloakResource.ASSET,
+            details=details,
+            detail_attr="id",
         )
 
     def is_authorized_asset_alias(
@@ -260,28 +292,34 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         user: KeycloakAuthManagerUser,
         details: AssetAliasDetails | None = None,
     ) -> bool:
-        asset_alias_id = details.id if details else None
-        return self._is_authorized(
+        return self._authorize_resource_from_details(
             method=method,
-            resource_type=KeycloakResource.ASSET_ALIAS,
             user=user,
-            resource_id=asset_alias_id,
+            resource_type=KeycloakResource.ASSET_ALIAS,
+            details=details,
+            detail_attr="id",
         )
 
     def is_authorized_variable(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: VariableDetails | None = None
     ) -> bool:
-        variable_key = details.key if details else None
-        return self._is_authorized(
-            method=method, resource_type=KeycloakResource.VARIABLE, user=user, resource_id=variable_key
+        return self._authorize_resource_from_details(
+            method=method,
+            user=user,
+            resource_type=KeycloakResource.VARIABLE,
+            details=details,
+            detail_attr="key",
         )
 
     def is_authorized_pool(
         self, *, method: ResourceMethod, user: KeycloakAuthManagerUser, details: PoolDetails | None = None
     ) -> bool:
-        pool_name = details.name if details else None
-        return self._is_authorized(
-            method=method, resource_type=KeycloakResource.POOL, user=user, resource_id=pool_name
+        return self._authorize_resource_from_details(
+            method=method,
+            user=user,
+            resource_type=KeycloakResource.POOL,
+            details=details,
+            detail_attr="name",
         )
 
     def is_authorized_view(self, *, access_view: AccessView, user: KeycloakAuthManagerUser) -> bool:
@@ -374,9 +412,29 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         elif method == "GET":
             method = "LIST"
 
+        if resource_type == KeycloakResource.DAG and method == "LIST":
+            return True
+
         if resource_type == KeycloakResource.DAG:
-            allowed_dags = resolve_allowed_dags(user.get_id(), context_attributes.get("team_name"))
-            context_attributes["allowed_dags"] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(allowed_dags or []))
+            requested_ids: set[str] = set()
+
+            dag_ids_attr = context_attributes.get(DAG_IDS_ATTRIBUTE_NAME)
+            if dag_ids_attr:
+                requested_ids.update(
+                    dag_id.strip()
+                    for dag_id in dag_ids_attr.split(DAG_IDS_ATTRIBUTE_SEPARATOR)
+                    if dag_id.strip()
+                )
+
+            if resource_id:
+                requested_ids.add(resource_id)
+
+            if requested_ids:
+                context_attributes[DAG_IDS_ATTRIBUTE_NAME] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(
+                    sorted(requested_ids)
+                )
+            else:
+                context_attributes.pop(DAG_IDS_ATTRIBUTE_NAME, None)
 
         resp = requests.post(
             self._get_token_url(server_url, realm),
@@ -415,10 +473,9 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         ):
             dag_ids_preview = context_attributes[DAG_IDS_ATTRIBUTE_NAME]
             log.debug(
-                "Submitting UMA batch request dag_ids=%s team=%s allowed=%s",
+                "Submitting UMA batch request dag_ids=%s team=%s",
                 dag_ids_preview,
                 context_attributes.get("team_name"),
-                context_attributes.get("allowed_dags"),
             )
 
         resp = requests.post(

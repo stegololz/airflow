@@ -44,6 +44,7 @@ from airflow.providers.keycloak.auth_manager.constants import (
     CONF_SERVER_URL_KEY,
 )
 from airflow.providers.keycloak.auth_manager.keycloak_auth_manager import (
+    DAG_IDS_ATTRIBUTE_NAME,
     RESOURCE_ID_ATTRIBUTE_NAME,
     KeycloakAuthManager,
 )
@@ -69,6 +70,7 @@ def user():
     user = Mock()
     user.access_token = "access_token"
     user.refresh_token = "refresh_token"
+    user.get_id.return_value = "test-user"
     return user
 
 
@@ -283,36 +285,27 @@ class TestKeycloakAuthManager:
         assert "Request not recognized by Keycloak. invalid_scope. Invalid scopes: GET" in str(e.value)
 
     @pytest.mark.parametrize(
-        ("method", "access_entity", "details", "permission", "attributes"),
+        "access_entity, details, permission, attributes",
         [
-            [
-                "GET",
-                None,
-                None,
-                "Dag#LIST",
-                {},
-            ],
-            [
-                "GET",
+            (
                 DagAccessEntity.TASK_INSTANCE,
                 DagDetails(id="test"),
                 "Dag#GET",
-                {RESOURCE_ID_ATTRIBUTE_NAME: "test", "dag_entity": "TASK_INSTANCE"},
-            ],
-            [
-                "GET",
+                {
+                    RESOURCE_ID_ATTRIBUTE_NAME: "test",
+                    "dag_entity": "TASK_INSTANCE",
+                    DAG_IDS_ATTRIBUTE_NAME: "test",
+                },
+            ),
+            (
                 None,
                 DagDetails(id="test"),
                 "Dag#GET",
-                {RESOURCE_ID_ATTRIBUTE_NAME: "test"},
-            ],
-            [
-                "GET",
-                DagAccessEntity.TASK_INSTANCE,
-                None,
-                "Dag#LIST",
-                {"dag_entity": "TASK_INSTANCE"},
-            ],
+                {
+                    RESOURCE_ID_ATTRIBUTE_NAME: "test",
+                    DAG_IDS_ATTRIBUTE_NAME: "test",
+                },
+            ),
         ],
     )
     @pytest.mark.parametrize(
@@ -326,7 +319,6 @@ class TestKeycloakAuthManager:
     def test_is_authorized_dag(
         self,
         mock_requests,
-        method,
         access_entity,
         details,
         permission,
@@ -339,7 +331,7 @@ class TestKeycloakAuthManager:
         mock_requests.post.return_value.status_code = status_code
 
         result = auth_manager.is_authorized_dag(
-            method=method, user=user, access_entity=access_entity, details=details
+            method="GET", user=user, access_entity=access_entity, details=details
         )
 
         token_url = auth_manager._get_token_url("server_url", "realm")
@@ -347,6 +339,13 @@ class TestKeycloakAuthManager:
         headers = auth_manager._get_headers("access_token")
         mock_requests.post.assert_called_once_with(token_url, data=payload, headers=headers)
         assert result == expected
+
+    @patch("airflow.providers.keycloak.auth_manager.keycloak_auth_manager.requests")
+    def test_is_authorized_dag_list_is_short_circuit(self, mock_requests, auth_manager, user):
+        result = auth_manager.is_authorized_dag(method="GET", user=user)
+
+        assert result is True
+        mock_requests.post.assert_not_called()
 
     @pytest.mark.parametrize(
         ("status_code", "expected"),
@@ -520,6 +519,21 @@ class TestKeycloakAuthManager:
             )
 
         assert result == dag_ids
+
+    def test_filter_authorized_dag_ids_allows_all_when_policy_says_so(self, auth_manager, user):
+        dag_ids = {"dag_alpha", "dag_beta", "dag_gamma"}
+        with patch.object(
+            auth_manager,
+            "_is_batch_authorized",
+            return_value=[{"scopes": sorted(dag_ids)}],
+        ) as mock_batch:
+            result = auth_manager.filter_authorized_dag_ids(
+                dag_ids=dag_ids,
+                user=user,
+            )
+
+        assert result == dag_ids
+        mock_batch.assert_called_once()
 
     def test_filter_authorized_dag_ids_returns_empty_on_denied(self, auth_manager, user):
         dag_ids = {"dag_a", "dag_b"}

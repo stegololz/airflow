@@ -58,27 +58,21 @@ var attributes = context.getAttributes();
 
     var dagIds = dagIdsAttr.get(0).split(/\s*,\s*/);
 
-    var allowedAttr = attributes.getValue("allowed_dags");
-    var allowAll = false;
-    var allowedIds = [];
-    if (!allowedAttr || allowedAttr.isEmpty()) {
-        allowAll = true;
-    } else {
-        var allowedRaw = allowedAttr.get(0);
-        if (allowedRaw === "*") {
-            allowAll = true;
-        } else if (allowedRaw) {
-            var entries = allowedRaw.split(/\s*,\s*/);
-            for (var idx = 0; idx < entries.length; idx++) {
-                if (entries[idx]) {
-                    allowedIds.push(entries[idx]);
-                }
-            }
-        }
-    }
-
     var permission = $evaluation.getPermission();
     var granted = false;
+
+    var isDagAllowedForUser = function (dagId) {
+        /**
+         * Customize this check to implement organisation specific policies.
+         * You can access Keycloak attributes via:
+         *
+         *   var identity = context.getIdentity();
+         *   identity.getAttributes().getValue("attribute_name");
+         *
+         * or use UMA context attributes such as team_name. By default we allow every DAG.
+         */
+        return true;
+    };
 
     for (var i = 0; i < dagIds.length; i++) {
         var dagId = dagIds[i];
@@ -86,18 +80,9 @@ var attributes = context.getAttributes();
             continue;
         }
 
-        if (allowAll) {
+        if (isDagAllowedForUser(dagId)) {
             permission.addScope(dagId);
             granted = true;
-            continue;
-        }
-
-        for (var j = 0; j < allowedIds.length; j++) {
-            if (allowedIds[j] === dagId) {
-                permission.addScope(dagId);
-                granted = true;
-                break;
-            }
         }
     }
 

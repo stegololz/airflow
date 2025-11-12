@@ -88,11 +88,17 @@ Run ``files/scripts/register_keycloak_base.sh`` to create the base client roles
 (``admin``, ``viewer``, ``user``, ``op``), their associated ``Allow-*`` policies, and the
 default resource permissions referenced above. After that, execute
 ``files/scripts/register_keycloak_policy.sh`` to upload the DAG visibility policy JAR and
-wire ``DagVisibilityPolicy`` to the ``DagVisibilityPermission`` entry. Airflow computes the
-list of DAG ids to request on behalf of a user in
-``resolve_allowed_dags`` (see
-``airflow/providers/keycloak/auth_manager/services/dag_visibility.py``); replace the stub
-there with logic that fits your environment.
+wire ``DagVisibilityPolicy`` to the ``DagVisibilityPermission`` entry. Airflow now simply
+passes the requested DAG ids to Keycloak, so all filtering logic should live in the JavaScript
+policy located at ``airflow/providers/keycloak/auth_manager/policies/dag_visibility.js``.
+Adjust ``isDagAllowedForUser`` in that file to implement your organisation specific rules.
+
+If your Keycloak instance is running in Docker (the default when starting Breeze with the
+``keycloak`` integration), you can also run
+``files/scripts/create_keycloak_permissions.sh`` to (re)create the standard ``Admin``,
+``ReadOnly``, ``User``, ``Op`` and ``DagVisibilityPermission`` entries without using the
+Airflow CLI. The script talks to the container via ``kcadm`` and only needs Docker and ``jq``
+installed on the host.
 
 More resources about permissions can be found in the official documentation of Keycloak:
 
