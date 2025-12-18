@@ -133,7 +133,10 @@ class TestXCom:
 
     @conf_vars({("core", "xcom_backend"): "to be removed"})
     def test_resolve_xcom_class_fallback_to_basexcom_no_config(self):
+        from airflow.sdk.configuration import conf as sdk_conf
+
         conf.remove_option("core", "xcom_backend")
+        sdk_conf.remove_option("core", "xcom_backend")
         cls = resolve_xcom_backend()
         assert issubclass(cls, BaseXCom)
         assert cls.serialize_value([1]) == [1]
@@ -435,7 +438,7 @@ class TestXComClear:
         push_simple_json_xcom(ti=task_instance, key="xcom_1", value={"key": "value"})
 
     @pytest.mark.usefixtures("setup_for_xcom_clear")
-    @mock.patch("airflow.models.xcom.XCom.purge")
+    @mock.patch("airflow.sdk.execution_time.xcom.XCom.purge")
     def test_xcom_clear(self, mock_purge, session, task_instance):
         assert session.query(XComModel).count() == 1
         XComModel.clear(

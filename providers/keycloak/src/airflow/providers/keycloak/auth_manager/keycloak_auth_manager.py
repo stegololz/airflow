@@ -27,7 +27,9 @@ from urllib.parse import urljoin
 
 import requests
 from fastapi import FastAPI
-from keycloak import KeycloakOpenID
+from keycloak import KeycloakOpenID, KeycloakPostError
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 from airflow.api_fastapi.app import AUTH_MANAGER_FASTAPI_APP_PREFIX
 from airflow.api_fastapi.auth.managers.base_auth_manager import BaseAuthManager
@@ -40,12 +42,14 @@ except ImportError:
 from airflow.api_fastapi.common.types import MenuItem
 from airflow.cli.cli_config import CLICommand, DefaultHelpParser, GroupCommand
 from airflow.configuration import conf
-from airflow.exceptions import AirflowException
+from airflow.providers.common.compat.sdk import AirflowException
 from airflow.providers.keycloak.auth_manager.cli.definition import KEYCLOAK_AUTH_MANAGER_COMMANDS
 from airflow.providers.keycloak.auth_manager.constants import (
     CONF_CLIENT_ID_KEY,
     CONF_CLIENT_SECRET_KEY,
     CONF_REALM_KEY,
+    CONF_REQUESTS_POOL_SIZE_KEY,
+    CONF_REQUESTS_RETRIES_KEY,
     CONF_SECTION_NAME,
     CONF_SERVER_URL_KEY,
 )
@@ -106,8 +110,34 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
     Leverages Keycloak to perform authentication and authorization in Airflow.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
+        self._http_session = None
+
+    @property
+    def http_session(self) -> requests.Session:
+        """Lazy-initialize and return the requests session with connection pooling."""
+        if self._http_session is not None:
+            return self._http_session
+
+        self._http_session = requests.Session()
+
+        pool_size = conf.getint(CONF_SECTION_NAME, CONF_REQUESTS_POOL_SIZE_KEY, fallback=10)
+        retry_total = conf.getint(CONF_SECTION_NAME, CONF_REQUESTS_RETRIES_KEY, fallback=3)
+
+        retry_strategy = Retry(
+            total=retry_total,
+            backoff_factor=0.1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+        )
+
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=retry_strategy)
+
+        self._http_session.mount("https://", adapter)
+        self._http_session.mount("http://", adapter)
+
+        return self._http_session
 
     def deserialize_user(self, token: dict[str, Any]) -> KeycloakAuthManagerUser:
         return KeycloakAuthManagerUser(
@@ -135,12 +165,12 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
     def refresh_user(self, *, user: KeycloakAuthManagerUser) -> KeycloakAuthManagerUser | None:
         if self._token_expired(user.access_token):
-            log.debug("Refreshing the token")
-            client = self.get_keycloak_client()
-            tokens = client.refresh_token(user.refresh_token)
-            user.refresh_token = tokens["refresh_token"]
-            user.access_token = tokens["access_token"]
-            return user
+            tokens = self.refresh_tokens(user=user)
+
+            if tokens:
+                user.refresh_token = tokens["refresh_token"]
+                user.access_token = tokens["access_token"]
+                return user
 
         return None
 
@@ -169,6 +199,20 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             resource_id=resource_id,
             attributes=attributes,
         )
+
+    def refresh_tokens(self, *, user: KeycloakAuthManagerUser) -> dict[str, str]:
+        try:
+            log.debug("Refreshing the token")
+            client = self.get_keycloak_client()
+            return client.refresh_token(user.refresh_token)
+        except KeycloakPostError as exc:
+            log.warning(
+                "KeycloakPostError encountered during token refresh. "
+                "Suppressing the exception and returning None.",
+                exc_info=exc,
+            )
+
+        return {}
 
     def is_authorized_configuration(
         self,
@@ -418,14 +462,18 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             else:
                 context_attributes.pop(DAG_IDS_ATTRIBUTE_NAME, None)
 
-        resp = requests.post(
+        resp = self.http_session.post(
             self._get_token_url(server_url, realm),
             data=self._get_payload(client_id, f"{resource_type.value}#{method}", context_attributes),
             headers=self._get_headers(user.access_token),
+            timeout=5,
         )
 
         if resp.status_code == 200:
             return True
+        if resp.status_code == 401:
+            log.debug("Received 401 from Keycloak: %s", resp.text)
+            return False
         if resp.status_code == 403:
             return False
         if resp.status_code == 400:
@@ -448,22 +496,11 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
 
         context_attributes = prune_dict(attributes or {}) if attributes else None
 
-        if (
-            log.isEnabledFor(logging.DEBUG)
-            and context_attributes
-            and context_attributes.get(DAG_IDS_ATTRIBUTE_NAME)
-        ):
-            dag_ids_preview = context_attributes[DAG_IDS_ATTRIBUTE_NAME]
-            log.debug(
-                "Submitting UMA batch request dag_ids=%s team=%s",
-                dag_ids_preview,
-                context_attributes.get("team_name"),
-            )
-
-        resp = requests.post(
+        resp = self.http_session.post(
             self._get_token_url(server_url, realm),
             data=self._get_batch_payload(client_id, permissions, context_attributes),
             headers=self._get_headers(user.access_token),
+            timeout=5,
         )
 
         if resp.status_code == 200:
