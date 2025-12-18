@@ -235,30 +235,12 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
             attributes["team_name"] = team_name
         attributes[DAG_IDS_ATTRIBUTE_NAME] = DAG_IDS_ATTRIBUTE_SEPARATOR.join(sorted(dag_ids))
 
-        if log.isEnabledFor(logging.INFO):
-            log.info(
-                "Keycloak DAG visibility request user=%s team=%s requested=%d sample=[%s]",
-                user.get_id(),
-                team_name or "-",
-                len(dag_ids),
-                _summarize(dag_ids),
-            )
-
         permissions = self._is_batch_authorized(
             permissions=[(method_value, KeycloakResource.DAG.value)],
             user=user,
             attributes=attributes,
         )
         authorized = self._extract_authorized_dag_ids(permissions, dag_ids)
-
-        if log.isEnabledFor(logging.INFO):
-            log.info(
-                "Keycloak DAG visibility grant user=%s team=%s count=%d sample=[%s]",
-                user.get_id(),
-                team_name or "-",
-                len(authorized),
-                _summarize(authorized),
-            )
 
         return authorized
 
