@@ -20,10 +20,12 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 import time
 import warnings
 from base64 import urlsafe_b64decode
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urljoin
 
 import httpx
@@ -91,6 +93,81 @@ if TYPE_CHECKING:
     from airflow.cli.cli_config import CLICommand
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+_REQUEST_TIMEOUT_SECONDS = 30
+_CACHE_TTL_SECONDS = 30
+
+_loop: asyncio.AbstractEventLoop | None = None
+_loop_lock = threading.Lock()
+
+_filter_cache: dict[tuple, tuple[float, frozenset[str]]] = {}
+_filter_pending: dict[tuple, threading.Event] = {}
+_cache_lock = threading.Lock()
+
+
+def _get_loop() -> asyncio.AbstractEventLoop:
+    """Return a shared event loop running in a background daemon thread."""
+    global _loop
+    if _loop is None or _loop.is_closed():
+        with _loop_lock:
+            if _loop is None or _loop.is_closed():
+                _loop = asyncio.new_event_loop()
+                threading.Thread(target=_loop.run_forever, daemon=True).start()
+    return _loop
+
+
+def _cache_get(key: tuple) -> frozenset[str] | None:
+    entry = _filter_cache.get(key)
+    if entry and (time.time() - entry[0]) < _CACHE_TTL_SECONDS:
+        return entry[1]
+    return None
+
+
+def _cache_set(key: tuple, value: frozenset[str]) -> None:
+    with _cache_lock:
+        _filter_cache[key] = (time.time(), value)
+        now = time.time()
+        for k in [k for k, (ts, _) in _filter_cache.items() if now - ts > _CACHE_TTL_SECONDS * 2]:
+            _filter_cache.pop(k, None)
+
+
+def _dedup_or_fetch(cache_key: tuple, fetch: Callable[[], set[str]]) -> set[str]:
+    """Return cached result, wait for a pending fetch, or run fetch ourselves."""
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return set(cached)
+
+    with _cache_lock:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return set(cached)
+
+        pending_event = _filter_pending.get(cache_key)
+        if pending_event is not None:
+            pass  # another thread is working on this
+        else:
+            pending_event = threading.Event()
+            _filter_pending[cache_key] = pending_event
+            pending_event = None  # we do the work
+
+    if pending_event is not None:
+        pending_event.wait(timeout=_REQUEST_TIMEOUT_SECONDS)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return set(cached)
+
+    try:
+        result = fetch()
+        _cache_set(cache_key, frozenset(result))
+        return result
+    finally:
+        with _cache_lock:
+            event = _filter_pending.pop(cache_key, None)
+        if event is not None:
+            event.set()
+
 
 RESOURCE_ID_ATTRIBUTE_NAME = "resource_id"
 TEAM_SCOPED_RESOURCES = frozenset(
@@ -518,7 +595,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         user: KeycloakAuthManagerUser,
     ) -> bool:
-        return asyncio.run(self._batch_is_authorized_connection_async(requests, user=user))
+        future = asyncio.run_coroutine_threadsafe(
+            self._batch_is_authorized_connection_async(requests, user=user), _get_loop()
+        )
+        return future.result(timeout=_REQUEST_TIMEOUT_SECONDS)
 
     def batch_is_authorized_dag(
         self,
@@ -526,7 +606,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         user: KeycloakAuthManagerUser,
     ) -> bool:
-        return asyncio.run(self._batch_is_authorized_dag_async(requests, user=user))
+        future = asyncio.run_coroutine_threadsafe(
+            self._batch_is_authorized_dag_async(requests, user=user), _get_loop()
+        )
+        return future.result(timeout=_REQUEST_TIMEOUT_SECONDS)
 
     def batch_is_authorized_pool(
         self,
@@ -534,7 +617,10 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         user: KeycloakAuthManagerUser,
     ) -> bool:
-        return asyncio.run(self._batch_is_authorized_pool_async(requests, user=user))
+        future = asyncio.run_coroutine_threadsafe(
+            self._batch_is_authorized_pool_async(requests, user=user), _get_loop()
+        )
+        return future.result(timeout=_REQUEST_TIMEOUT_SECONDS)
 
     def batch_is_authorized_variable(
         self,
@@ -542,10 +628,18 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         *,
         user: KeycloakAuthManagerUser,
     ) -> bool:
-        return asyncio.run(self._batch_is_authorized_variable_async(requests, user=user))
+        future = asyncio.run_coroutine_threadsafe(
+            self._batch_is_authorized_variable_async(requests, user=user), _get_loop()
+        )
+        return future.result(timeout=_REQUEST_TIMEOUT_SECONDS)
+
+    async def _get_shared_semaphore(self) -> asyncio.Semaphore:
+        if not hasattr(KeycloakAuthManager, "_shared_sem"):
+            KeycloakAuthManager._shared_sem = asyncio.Semaphore(self._get_async_concurrency_limit())
+        return KeycloakAuthManager._shared_sem
 
     async def _gather_with_concurrency(self, *coros) -> list:
-        sem = asyncio.Semaphore(self._get_async_concurrency_limit())
+        sem = await self._get_shared_semaphore()
 
         async def limited(coro):
             async with sem:
@@ -654,11 +748,18 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
         method: ResourceMethod = "GET",
         team_name: str | None = None,
     ) -> set[str]:
-        return asyncio.run(
-            self._filter_authorized_dag_ids_async(
-                dag_ids=dag_ids, user=user, method=method, team_name=team_name
+        cache_key = (user.get_id(), method, team_name, frozenset(dag_ids))
+
+        def fetch() -> set[str]:
+            future = asyncio.run_coroutine_threadsafe(
+                self._filter_authorized_dag_ids_async(
+                    dag_ids=dag_ids, user=user, method=method, team_name=team_name
+                ),
+                _get_loop(),
             )
-        )
+            return future.result(timeout=_REQUEST_TIMEOUT_SECONDS)
+
+        return _dedup_or_fetch(cache_key, fetch)
 
     async def _filter_authorized_dag_ids_async(
         self,
