@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -25,6 +26,7 @@ from base64 import urlsafe_b64decode
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
+import httpx
 import requests
 from fastapi import FastAPI
 from keycloak import KeycloakOpenID
@@ -50,6 +52,7 @@ except ModuleNotFoundError:
     from airflow.configuration import conf
     from airflow.exceptions import AirflowException
 from airflow.providers.keycloak.auth_manager.constants import (
+    CONF_ASYNC_CONCURRENCY_LIMIT_KEY,
     CONF_CLIENT_ID_KEY,
     CONF_CLIENT_SECRET_KEY,
     CONF_REALM_KEY,
@@ -63,7 +66,15 @@ from airflow.providers.keycloak.auth_manager.user import KeycloakAuthManagerUser
 from airflow.utils.helpers import prune_dict
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
+    from airflow.api_fastapi.auth.managers.models.batch_apis import (
+        IsAuthorizedConnectionRequest,
+        IsAuthorizedDagRequest,
+        IsAuthorizedPoolRequest,
+        IsAuthorizedVariableRequest,
+    )
     from airflow.api_fastapi.auth.managers.models.resource_details import (
         AccessView,
         AssetAliasDetails,
@@ -439,6 +450,242 @@ class KeycloakAuthManager(BaseAuthManager[KeycloakAuthManagerUser]):
                 f"Request not recognized by Keycloak. {error.get('error')}. {error.get('error_description')}"
             )
         raise AirflowException(f"Unexpected error: {resp.status_code} - {resp.text}")
+
+    def _get_async_client(self) -> httpx.AsyncClient:
+        retry_total = conf.getint(CONF_SECTION_NAME, CONF_REQUESTS_RETRIES_KEY, fallback=3)
+        transport = httpx.AsyncHTTPTransport(retries=retry_total)
+        return httpx.AsyncClient(transport=transport)
+
+    def _get_async_concurrency_limit(self) -> int:
+        return conf.getint(CONF_SECTION_NAME, CONF_ASYNC_CONCURRENCY_LIMIT_KEY, fallback=50)
+
+    async def _is_authorized_async(
+        self,
+        *,
+        method: ResourceMethod | str,
+        resource_type: KeycloakResource,
+        user: KeycloakAuthManagerUser,
+        async_client: httpx.AsyncClient,
+        resource_id: str | None = None,
+        team_name: str | None = None,
+        attributes: dict[str, str | None] | None = None,
+    ) -> bool:
+        """Async version of ``_is_authorized`` using httpx for concurrent batch checks."""
+        client_id = conf.get(CONF_SECTION_NAME, CONF_CLIENT_ID_KEY)
+        realm = conf.get(CONF_SECTION_NAME, CONF_REALM_KEY)
+        server_url = conf.get(CONF_SECTION_NAME, CONF_SERVER_URL_KEY)
+
+        context_attributes = prune_dict(attributes or {})
+        if resource_id:
+            context_attributes[RESOURCE_ID_ATTRIBUTE_NAME] = resource_id
+        elif method == "GET":
+            method = "LIST"
+
+        if (
+            team_name
+            and conf.getboolean("core", "multi_team", fallback=False)
+            and resource_type in TEAM_SCOPED_RESOURCES
+        ):
+            resource_name = f"{resource_type.value}:{team_name}"
+        else:
+            resource_name = resource_type.value
+        permission = f"{resource_name}#{method}"
+
+        resp = await async_client.post(
+            self._get_token_url(server_url, realm),
+            data=self._get_payload(client_id, permission, context_attributes),
+            headers=self._get_headers(user.access_token),
+            timeout=5,
+        )
+
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 401:
+            log.debug("Received 401 from Keycloak: %s", resp.text)
+            return False
+        if resp.status_code == 403:
+            return False
+        if resp.status_code == 400:
+            error = json.loads(resp.text)
+            raise AirflowException(
+                f"Request not recognized by Keycloak. {error.get('error')}. {error.get('error_description')}"
+            )
+        raise AirflowException(f"Unexpected error: {resp.status_code} - {resp.text}")
+
+    def batch_is_authorized_connection(
+        self,
+        requests: Sequence[IsAuthorizedConnectionRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        return asyncio.run(self._batch_is_authorized_connection_async(requests, user=user))
+
+    def batch_is_authorized_dag(
+        self,
+        requests: Sequence[IsAuthorizedDagRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        return asyncio.run(self._batch_is_authorized_dag_async(requests, user=user))
+
+    def batch_is_authorized_pool(
+        self,
+        requests: Sequence[IsAuthorizedPoolRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        return asyncio.run(self._batch_is_authorized_pool_async(requests, user=user))
+
+    def batch_is_authorized_variable(
+        self,
+        requests: Sequence[IsAuthorizedVariableRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        return asyncio.run(self._batch_is_authorized_variable_async(requests, user=user))
+
+    async def _gather_with_concurrency(self, *coros) -> list:
+        sem = asyncio.Semaphore(self._get_async_concurrency_limit())
+
+        async def limited(coro):
+            async with sem:
+                return await coro
+
+        return list(await asyncio.gather(*(limited(c) for c in coros)))
+
+    async def _batch_is_authorized_connection_async(
+        self,
+        requests: Sequence[IsAuthorizedConnectionRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        async with self._get_async_client() as client:
+            results = await self._gather_with_concurrency(
+                *(
+                    self._is_authorized_async(
+                        method=request["method"],
+                        resource_type=KeycloakResource.CONNECTION,
+                        user=user,
+                        async_client=client,
+                        resource_id=request.get("details").conn_id if request.get("details") else None,
+                        team_name=self._get_team_name(request.get("details")),
+                    )
+                    for request in requests
+                )
+            )
+        return all(results)
+
+    async def _batch_is_authorized_dag_async(
+        self,
+        requests: Sequence[IsAuthorizedDagRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        async with self._get_async_client() as client:
+            results = await self._gather_with_concurrency(
+                *(
+                    self._is_authorized_async(
+                        method=request["method"],
+                        resource_type=KeycloakResource.DAG,
+                        user=user,
+                        async_client=client,
+                        resource_id=request.get("details").id if request.get("details") else None,
+                        team_name=self._get_team_name(request.get("details")),
+                        attributes={
+                            "dag_entity": request.get("access_entity").value
+                            if request.get("access_entity")
+                            else None
+                        },
+                    )
+                    for request in requests
+                )
+            )
+        return all(results)
+
+    async def _batch_is_authorized_pool_async(
+        self,
+        requests: Sequence[IsAuthorizedPoolRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        async with self._get_async_client() as client:
+            results = await self._gather_with_concurrency(
+                *(
+                    self._is_authorized_async(
+                        method=request["method"],
+                        resource_type=KeycloakResource.POOL,
+                        user=user,
+                        async_client=client,
+                        resource_id=request.get("details").name if request.get("details") else None,
+                        team_name=self._get_team_name(request.get("details")),
+                    )
+                    for request in requests
+                )
+            )
+        return all(results)
+
+    async def _batch_is_authorized_variable_async(
+        self,
+        requests: Sequence[IsAuthorizedVariableRequest],
+        *,
+        user: KeycloakAuthManagerUser,
+    ) -> bool:
+        async with self._get_async_client() as client:
+            results = await self._gather_with_concurrency(
+                *(
+                    self._is_authorized_async(
+                        method=request["method"],
+                        resource_type=KeycloakResource.VARIABLE,
+                        user=user,
+                        async_client=client,
+                        resource_id=request.get("details").key if request.get("details") else None,
+                        team_name=self._get_team_name(request.get("details")),
+                    )
+                    for request in requests
+                )
+            )
+        return all(results)
+
+    def filter_authorized_dag_ids(
+        self,
+        *,
+        dag_ids: set[str],
+        user: KeycloakAuthManagerUser,
+        method: ResourceMethod = "GET",
+        team_name: str | None = None,
+    ) -> set[str]:
+        return asyncio.run(
+            self._filter_authorized_dag_ids_async(
+                dag_ids=dag_ids, user=user, method=method, team_name=team_name
+            )
+        )
+
+    async def _filter_authorized_dag_ids_async(
+        self,
+        *,
+        dag_ids: set[str],
+        user: KeycloakAuthManagerUser,
+        method: ResourceMethod = "GET",
+        team_name: str | None = None,
+    ) -> set[str]:
+        if not dag_ids:
+            return set()
+        dag_id_list = list(dag_ids)
+        async with self._get_async_client() as client:
+            results = await self._gather_with_concurrency(
+                *(
+                    self._is_authorized_async(
+                        method=method,
+                        resource_type=KeycloakResource.DAG,
+                        user=user,
+                        async_client=client,
+                        resource_id=dag_id,
+                        team_name=team_name,
+                    )
+                    for dag_id in dag_id_list
+                )
+            )
+        return {dag_id for dag_id, authorized in zip(dag_id_list, results) if authorized}
 
     def _is_batch_authorized(
         self,
