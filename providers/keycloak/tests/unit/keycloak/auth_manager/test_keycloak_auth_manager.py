@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
+import time
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 from keycloak import KeycloakPostError
@@ -51,6 +53,7 @@ try:
     from airflow.providers.common.compat.sdk import AirflowException
 except ModuleNotFoundError:
     from airflow.exceptions import AirflowException
+from airflow.providers.keycloak.auth_manager import keycloak_auth_manager as kam_module
 from airflow.providers.keycloak.auth_manager.constants import (
     CONF_CLIENT_ID_KEY,
     CONF_CLIENT_SECRET_KEY,
@@ -107,6 +110,16 @@ def user():
     user.access_token = "access_token"
     user.refresh_token = "refresh_token"
     return user
+
+
+@pytest.fixture(autouse=True)
+def _clear_filter_cache():
+    """Clear module-level single-flight cache between tests."""
+    kam_module._filter_cache.clear()
+    kam_module._filter_pending.clear()
+    yield
+    kam_module._filter_cache.clear()
+    kam_module._filter_pending.clear()
 
 
 class TestKeycloakAuthManager:
@@ -622,46 +635,24 @@ class TestKeycloakAuthManager:
         assert actual_permission == permission
 
     @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="team_name not supported before Airflow 3.2.0")
-    def test_filter_authorized_dag_ids_team_mismatch(self, auth_manager_multi_team, user):
-        mock_resp = AsyncMock()
-        mock_resp.status_code = 403
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
-            result = auth_manager_multi_team.filter_authorized_dag_ids(
-                dag_ids={"dag-a"}, user=user, team_name="team-b"
-            )
+    @patch.object(KeycloakAuthManager, "_is_authorized", return_value=False)
+    def test_filter_authorized_dag_ids_team_mismatch(self, mock_is_authorized, auth_manager_multi_team, user):
+        result = auth_manager_multi_team.filter_authorized_dag_ids(
+            dag_ids={"dag-a"}, user=user, team_name="team-b"
+        )
 
         assert result == set()
-        assert mock_client.post.call_count == 1
+        assert mock_is_authorized.call_count == 1
 
     @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="team_name not supported before Airflow 3.2.0")
-    def test_filter_authorized_dag_ids_team_match(self, auth_manager_multi_team, user):
-        mock_resp = AsyncMock()
-        mock_resp.status_code = 200
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
-            result = auth_manager_multi_team.filter_authorized_dag_ids(
-                dag_ids={"dag-a"}, user=user, team_name="team-a"
-            )
+    @patch.object(KeycloakAuthManager, "_is_authorized", return_value=True)
+    def test_filter_authorized_dag_ids_team_match(self, mock_is_authorized, auth_manager_multi_team, user):
+        result = auth_manager_multi_team.filter_authorized_dag_ids(
+            dag_ids={"dag-a"}, user=user, team_name="team-a"
+        )
 
         assert result == {"dag-a"}
-        assert mock_client.post.call_count == 1
+        assert mock_is_authorized.call_count == 1
 
     @pytest.mark.skipif(not AIRFLOW_V_3_2_PLUS, reason="team_name not supported before Airflow 3.2.0")
     @patch.object(KeycloakAuthManager, "is_authorized_pool", return_value=False)
@@ -993,27 +984,14 @@ class TestKeycloakAuthManager:
         ],
     )
     def test_batch_is_authorized_dag(self, status_codes, expected, auth_manager, user):
-        mock_responses = []
-        for code in status_codes:
-            resp = AsyncMock()
-            resp.status_code = code
-            mock_responses.append(resp)
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=mock_responses)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return_values = [code == 200 for code in status_codes]
 
         requests = [{"method": "GET", "details": DagDetails(id=f"dag_{i}")} for i in range(len(status_codes))]
 
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
+        with patch.object(KeycloakAuthManager, "_is_authorized", side_effect=return_values):
             result = auth_manager.batch_is_authorized_dag(requests, user=user)
 
         assert result == expected
-        assert mock_client.post.call_count == len(status_codes)
 
     @pytest.mark.parametrize(
         ("status_codes", "expected"),
@@ -1023,30 +1001,17 @@ class TestKeycloakAuthManager:
         ],
     )
     def test_batch_is_authorized_connection(self, status_codes, expected, auth_manager, user):
-        mock_responses = []
-        for code in status_codes:
-            resp = AsyncMock()
-            resp.status_code = code
-            mock_responses.append(resp)
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=mock_responses)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return_values = [code == 200 for code in status_codes]
 
         requests = [
             {"method": "GET", "details": ConnectionDetails(conn_id=f"conn_{i}")}
             for i in range(len(status_codes))
         ]
 
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
+        with patch.object(KeycloakAuthManager, "_is_authorized", side_effect=return_values):
             result = auth_manager.batch_is_authorized_connection(requests, user=user)
 
         assert result == expected
-        assert mock_client.post.call_count == len(status_codes)
 
     @pytest.mark.parametrize(
         ("status_codes", "expected"),
@@ -1056,29 +1021,16 @@ class TestKeycloakAuthManager:
         ],
     )
     def test_batch_is_authorized_pool(self, status_codes, expected, auth_manager, user):
-        mock_responses = []
-        for code in status_codes:
-            resp = AsyncMock()
-            resp.status_code = code
-            mock_responses.append(resp)
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=mock_responses)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return_values = [code == 200 for code in status_codes]
 
         requests = [
             {"method": "GET", "details": PoolDetails(name=f"pool_{i}")} for i in range(len(status_codes))
         ]
 
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
+        with patch.object(KeycloakAuthManager, "_is_authorized", side_effect=return_values):
             result = auth_manager.batch_is_authorized_pool(requests, user=user)
 
         assert result == expected
-        assert mock_client.post.call_count == len(status_codes)
 
     @pytest.mark.parametrize(
         ("status_codes", "expected"),
@@ -1088,43 +1040,22 @@ class TestKeycloakAuthManager:
         ],
     )
     def test_batch_is_authorized_variable(self, status_codes, expected, auth_manager, user):
-        mock_responses = []
-        for code in status_codes:
-            resp = AsyncMock()
-            resp.status_code = code
-            mock_responses.append(resp)
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=mock_responses)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return_values = [code == 200 for code in status_codes]
 
         requests = [
             {"method": "GET", "details": VariableDetails(key=f"var_{i}")} for i in range(len(status_codes))
         ]
 
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
+        with patch.object(KeycloakAuthManager, "_is_authorized", side_effect=return_values):
             result = auth_manager.batch_is_authorized_variable(requests, user=user)
 
         assert result == expected
-        assert mock_client.post.call_count == len(status_codes)
 
     def test_batch_is_authorized_dag_empty_requests(self, auth_manager, user):
         result = auth_manager.batch_is_authorized_dag([], user=user)
         assert result is True
 
     def test_batch_is_authorized_dag_with_access_entity(self, auth_manager, user):
-        mock_resp = AsyncMock()
-        mock_resp.status_code = 200
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
         requests = [
             {
                 "method": "GET",
@@ -1133,63 +1064,94 @@ class TestKeycloakAuthManager:
             }
         ]
 
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
+        with patch.object(KeycloakAuthManager, "_is_authorized", return_value=True) as mock_is_authorized:
             result = auth_manager.batch_is_authorized_dag(requests, user=user)
 
         assert result is True
         # Verify the call included the dag_entity attribute
-        call_kwargs = mock_client.post.call_args
-        payload = call_kwargs.kwargs["data"]
-        assert "claim_token" in payload
+        call_kwargs = mock_is_authorized.call_args
+        assert call_kwargs.kwargs["attributes"] == {"dag_entity": "TASK_INSTANCE"}
 
     def test_filter_authorized_dag_ids(self, auth_manager, user):
-        mock_responses = []
-        for code in [200, 403, 200]:
-            resp = AsyncMock()
-            resp.status_code = code
-            mock_responses.append(resp)
+        # dag_0 → True, dag_1 → False, dag_2 → True
+        side_effects = {"dag_0": True, "dag_1": False, "dag_2": True}
 
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=mock_responses)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
+        with patch.object(
+            KeycloakAuthManager,
+            "_is_authorized",
+            side_effect=lambda *, resource_id, **kw: side_effects[resource_id],
+        ) as mock_is_authorized:
             result = auth_manager.filter_authorized_dag_ids(
                 dag_ids={"dag_0", "dag_1", "dag_2"}, user=user, method="GET"
             )
 
-        assert len(result) == 2
-        assert mock_client.post.call_count == 3
+        assert result == {"dag_0", "dag_2"}
+        assert mock_is_authorized.call_count == 3
 
     def test_filter_authorized_dag_ids_empty(self, auth_manager, user):
         result = auth_manager.filter_authorized_dag_ids(dag_ids=set(), user=user, method="GET")
         assert result == set()
 
-    def test_filter_authorized_dag_ids_all_denied(self, auth_manager, user):
-        mock_responses = []
-        for code in [403, 403]:
-            resp = AsyncMock()
-            resp.status_code = code
-            mock_responses.append(resp)
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(side_effect=mock_responses)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch(
-            "airflow.providers.keycloak.auth_manager.keycloak_auth_manager.KeycloakAuthManager._get_async_client",
-            return_value=mock_client,
-        ):
-            result = auth_manager.filter_authorized_dag_ids(
-                dag_ids={"dag_0", "dag_1"}, user=user, method="GET"
-            )
+    @patch.object(KeycloakAuthManager, "_is_authorized", return_value=False)
+    def test_filter_authorized_dag_ids_all_denied(self, mock_is_authorized, auth_manager, user):
+        result = auth_manager.filter_authorized_dag_ids(dag_ids={"dag_0", "dag_1"}, user=user, method="GET")
 
         assert result == set()
+        assert mock_is_authorized.call_count == 2
+
+    @patch.object(KeycloakAuthManager, "_is_authorized", return_value=True)
+    def test_filter_authorized_dag_ids_cache_hit(self, mock_is_authorized, auth_manager, user):
+        """Second call with same args should return cached result without hitting Keycloak."""
+        dag_ids = {"dag_0", "dag_1"}
+
+        result1 = auth_manager.filter_authorized_dag_ids(dag_ids=dag_ids, user=user, method="GET")
+        result2 = auth_manager.filter_authorized_dag_ids(dag_ids=dag_ids, user=user, method="GET")
+
+        assert result1 == dag_ids
+        assert result2 == dag_ids
+        # _is_authorized should only be called for the first invocation (2 dag_ids × 1 call)
+        assert mock_is_authorized.call_count == 2
+
+    def test_filter_authorized_dag_ids_single_flight(self, auth_manager, user):
+        """Concurrent threads with the same cache key should coalesce into one Keycloak call."""
+        call_count = 0
+        gate = threading.Event()
+
+        def slow_is_authorized(*, resource_id, **kw):
+            nonlocal call_count
+            call_count += 1
+            # Block until the gate is opened so other threads pile up
+            gate.wait(timeout=5)
+            return True
+
+        dag_ids = {"dag_0"}
+        results = [None] * 5
+        errors = []
+
+        def run_filter(index):
+            try:
+                results[index] = auth_manager.filter_authorized_dag_ids(
+                    dag_ids=dag_ids, user=user, method="GET"
+                )
+            except Exception as e:
+                errors.append(e)
+
+        with patch.object(KeycloakAuthManager, "_is_authorized", side_effect=slow_is_authorized):
+            threads = [threading.Thread(target=run_filter, args=(i,)) for i in range(5)]
+            for t in threads:
+                t.start()
+
+            # Give threads time to enter _single_flight
+            time.sleep(0.1)
+
+            # Open the gate — the active flight completes and waiters read from cache
+            gate.set()
+
+            for t in threads:
+                t.join(timeout=5)
+
+        assert not errors, f"Threads raised errors: {errors}"
+        for r in results:
+            assert r == dag_ids
+        # Only one thread should have called _is_authorized (the active flight)
+        assert call_count == 1
