@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -824,6 +825,7 @@ class TestCommands:
         client.connection.raw_post = Mock(
             return_value=Mock(status_code=201, json=Mock(return_value={"message": ""}), text="{}")
         )
+        client.connection.raw_put = Mock(return_value=Mock(status_code=204, text=""))
         client.connection.realm_name = "test-realm"
 
         params = [
@@ -847,6 +849,80 @@ class TestCommands:
         mock_create_permissions.assert_called_once_with(client, "test-id", teams=[], _dry_run=False)
         mock_ensure_default_role_policies.assert_called_once_with(client, "test-id", _dry_run=False)
         mock_attach_default_role_permissions.assert_called_once_with(client, "test-id", _dry_run=False)
+        client.connection.raw_put.assert_called_once_with(
+            "admin/realms/test-realm/clients/test-id/authz/resource-server",
+            data=json.dumps({"decisionStrategy": "AFFIRMATIVE"}),
+        )
+
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._wire_team")
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._ensure_role_policy")
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._create_group_membership_mapper")
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._create_permissions")
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._create_resources")
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._create_scopes")
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._get_client")
+    def test_create_all_with_teams_wires_each_team(
+        self,
+        mock_get_client,
+        mock_create_scopes,
+        mock_create_resources,
+        mock_create_permissions,
+        mock_create_group_membership_mapper,
+        mock_ensure_role_policy,
+        mock_wire_team,
+    ):
+        client = Mock()
+        mock_get_client.return_value = client
+        client.get_clients.return_value = [{"id": "test-id", "clientId": "test_client_id"}]
+        client.connection = Mock()
+        client.connection.raw_get = Mock(return_value=Mock(text="[]"))
+        client.connection.raw_put = Mock(return_value=Mock(status_code=204, text=""))
+        client.connection.realm_name = "test-realm"
+
+        params = [
+            "keycloak-auth-manager",
+            "create-all",
+            "--teams",
+            "team-a,team-b",
+            "--username",
+            "test",
+            "--password",
+            "test",
+        ]
+        with conf_vars(
+            {
+                ("keycloak_auth_manager", "client_id"): "test_client_id",
+                ("core", "multi_team"): "True",
+            }
+        ):
+            create_all_command(self.arg_parser.parse_args(params))
+
+        mock_wire_team.assert_any_call(client, "test-id", "team-a", _dry_run=False)
+        mock_wire_team.assert_any_call(client, "test-id", "team-b", _dry_run=False)
+        assert mock_wire_team.call_count == 2
+
+    @patch("airflow.providers.keycloak.auth_manager.cli.commands._get_client")
+    def test_create_all_without_teams_refuses_when_multi_team_enabled(self, mock_get_client):
+        client = Mock()
+        mock_get_client.return_value = client
+        client.get_clients.return_value = [{"id": "test-id", "clientId": "test_client_id"}]
+
+        params = [
+            "keycloak-auth-manager",
+            "create-all",
+            "--username",
+            "test",
+            "--password",
+            "test",
+        ]
+        with conf_vars(
+            {
+                ("keycloak_auth_manager", "client_id"): "test_client_id",
+                ("core", "multi_team"): "True",
+            }
+        ):
+            with pytest.raises(SystemExit, match="multi_team is enabled"):
+                create_all_command(self.arg_parser.parse_args(params))
 
     @patch("airflow.providers.keycloak.auth_manager.cli.commands._get_client")
     def test_create_scopes_dry_run(self, mock_get_client):

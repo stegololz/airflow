@@ -22,7 +22,12 @@ from enum import Enum
 from typing import get_args
 
 from keycloak import KeycloakAdmin, KeycloakError
-from keycloak.exceptions import KeycloakGetError, KeycloakPostError, raise_error_from_response
+from keycloak.exceptions import (
+    KeycloakGetError,
+    KeycloakPostError,
+    KeycloakPutError,
+    raise_error_from_response,
+)
 
 from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
 from airflow.api_fastapi.common.types import MenuItem
@@ -153,10 +158,17 @@ def create_all_command(args):
     client_uuid = _get_client_uuid(args)
     teams = _parse_teams(args.teams)
     _ensure_multi_team_enabled(teams=teams, command_name="create-all")
+    if not teams and conf.getboolean("core", "multi_team", fallback=False):
+        raise SystemExit(
+            "core.multi_team is enabled but no --teams were passed to create-all. "
+            "Without --teams the command attaches single-team permissions that grant "
+            "access across all teams. Pass --teams with at least one team."
+        )
 
     _create_scopes(client, client_uuid, _dry_run=args.dry_run)
     _create_resources(client, client_uuid, teams=teams, _dry_run=args.dry_run)
     _create_group_membership_mapper(client, client_uuid, _dry_run=args.dry_run)
+    _set_resource_server_decision_strategy(client, client_uuid, _dry_run=args.dry_run)
     if teams:
         # Role policies are only needed for team-scoped (group+role) authorization.
         for role_name in TEAM_ROLE_NAMES:
@@ -167,6 +179,29 @@ def create_all_command(args):
     _create_permissions(client, client_uuid, teams=teams, _dry_run=args.dry_run)
     if not teams:
         _attach_default_role_permissions(client, client_uuid, _dry_run=args.dry_run)
+    for team in teams:
+        _wire_team(client, client_uuid, team, _dry_run=args.dry_run)
+
+
+def _set_resource_server_decision_strategy(
+    client: KeycloakAdmin, client_uuid: str, *, _dry_run: bool = False
+) -> None:
+    """
+    Set the client resource server decision strategy to AFFIRMATIVE.
+
+    Several permissions created by this CLI cover the same resource (for example
+    ReadOnly, User and Admin all grant on Dag). Under Keycloak's default UNANIMOUS
+    strategy every covering permission must permit, so no role is ever granted.
+    AFFIRMATIVE grants access when any permission permits, which is the semantics
+    of the permission model created here.
+    """
+    if _dry_run:
+        print("Would set the resource server decision strategy to AFFIRMATIVE.")
+        return
+    realm = client.connection.realm_name
+    url = f"admin/realms/{realm}/clients/{client_uuid}/authz/resource-server"
+    data_raw = client.connection.raw_put(url, data=json.dumps({"decisionStrategy": "AFFIRMATIVE"}))
+    raise_error_from_response(data_raw, KeycloakPutError, expected_codes=[200, 201, 204])
 
 
 def _get_client(args):
@@ -769,13 +804,18 @@ def create_team_command(args):
     _create_resources(client, client_uuid, teams=[team], _dry_run=args.dry_run)
     _create_group_membership_mapper(client, client_uuid, _dry_run=args.dry_run)
     _create_permissions(client, client_uuid, teams=[team], include_global_admin=False, _dry_run=args.dry_run)
-    _ensure_group(client, team, _dry_run=args.dry_run)
-    _ensure_team_policies(client, client_uuid, team, _dry_run=args.dry_run)
-    _attach_team_permissions(client, client_uuid, team, _dry_run=args.dry_run)
-    _attach_team_menu_permissions(client, client_uuid, team, _dry_run=args.dry_run)
-    _attach_superadmin_permissions(client, client_uuid, team, _dry_run=args.dry_run)
-    _update_read_only_permission_resources(client, client_uuid, _dry_run=args.dry_run)
-    _update_admin_permission_resources(client, client_uuid, _dry_run=args.dry_run)
+    _wire_team(client, client_uuid, team, _dry_run=args.dry_run)
+
+
+def _wire_team(client: KeycloakAdmin, client_uuid: str, team: str, *, _dry_run: bool = False) -> None:
+    """Create the group, the team policies and the permission attachments for one team."""
+    _ensure_group(client, team, _dry_run=_dry_run)
+    _ensure_team_policies(client, client_uuid, team, _dry_run=_dry_run)
+    _attach_team_permissions(client, client_uuid, team, _dry_run=_dry_run)
+    _attach_team_menu_permissions(client, client_uuid, team, _dry_run=_dry_run)
+    _attach_superadmin_permissions(client, client_uuid, team, _dry_run=_dry_run)
+    _update_read_only_permission_resources(client, client_uuid, _dry_run=_dry_run)
+    _update_admin_permission_resources(client, client_uuid, _dry_run=_dry_run)
 
 
 @cli_utils.action_cli
