@@ -1259,6 +1259,8 @@ mypy_path = [
     "$MYPY_CONFIG_FILE_DIR/providers/jenkins/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/keycloak/src",
     "$MYPY_CONFIG_FILE_DIR/providers/keycloak/tests",
+    "$MYPY_CONFIG_FILE_DIR/providers/microsoft/adfs/src",
+    "$MYPY_CONFIG_FILE_DIR/providers/microsoft/adfs/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/microsoft/azure/src",
     "$MYPY_CONFIG_FILE_DIR/providers/microsoft/azure/tests",
     "$MYPY_CONFIG_FILE_DIR/providers/microsoft/mssql/src",
@@ -1568,6 +1570,7 @@ apache-airflow-providers-informatica = false
 apache-airflow-providers-jdbc = false
 apache-airflow-providers-jenkins = false
 apache-airflow-providers-keycloak = false
+apache-airflow-providers-microsoft-adfs = false
 apache-airflow-providers-microsoft-azure = false
 apache-airflow-providers-microsoft-mssql = false
 apache-airflow-providers-microsoft-psrp = false
@@ -1767,6 +1770,7 @@ apache-airflow-providers-informatica = false
 apache-airflow-providers-jdbc = false
 apache-airflow-providers-jenkins = false
 apache-airflow-providers-keycloak = false
+apache-airflow-providers-microsoft-adfs = false
 apache-airflow-providers-microsoft-azure = false
 apache-airflow-providers-microsoft-mssql = false
 apache-airflow-providers-microsoft-psrp = false
@@ -1940,6 +1944,7 @@ apache-airflow-providers-informatica = { workspace = true }
 apache-airflow-providers-jdbc = { workspace = true }
 apache-airflow-providers-jenkins = { workspace = true }
 apache-airflow-providers-keycloak = { workspace = true }
+apache-airflow-providers-microsoft-adfs = { workspace = true }
 apache-airflow-providers-microsoft-azure = { workspace = true }
 apache-airflow-providers-microsoft-mssql = { workspace = true }
 apache-airflow-providers-microsoft-psrp = { workspace = true }
@@ -2086,6 +2091,7 @@ members = [
     "providers/jdbc",
     "providers/jenkins",
     "providers/keycloak",
+    "providers/microsoft/adfs",
     "providers/microsoft/azure",
     "providers/microsoft/mssql",
     "providers/microsoft/psrp",

@@ -209,6 +209,9 @@ labelPRBasedOnFilePath:
   provider:keycloak:
     - providers/keycloak/**
 
+  provider:microsoft-adfs:
+    - providers/microsoft/adfs/**
+
   provider:microsoft-azure:
     - providers/microsoft/azure/**
 

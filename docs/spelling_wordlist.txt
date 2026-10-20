@@ -21,6 +21,7 @@ adb
 adbc
 additionalProperties
 adf
+adfs
 adhoc
 adls
 adobjects

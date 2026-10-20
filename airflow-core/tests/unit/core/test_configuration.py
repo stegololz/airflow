@@ -1905,6 +1905,7 @@ def test_sensitive_values():
         ("sentry", "sentry_dsn"),
         ("database", "sql_alchemy_engine_args"),
         ("keycloak_auth_manager", "client_secret"),
+        ("adfs_auth_manager", "client_secret"),
         ("celery_broker_transport_options", "sentinel_kwargs"),
         ("celery", "broker_url"),
         ("celery", "flower_basic_auth"),
