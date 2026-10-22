@@ -65,6 +65,34 @@ views are available to every role. Any other view, such as the audit log, import
 of files not tied to a Dag, requires ``ADMIN``. The Connections and Variables menu entries are shown
 to ``OP`` and ``ADMIN`` only.
 
+.. _adfs-dag-grants:
+
+Dag grants
+----------
+
+``[adfs_auth_manager] dag_role_mapping`` gives users a role on some Dags only. It maps claim values to
+lists of grants, each with ``dags`` (a Dag ID, or an ``fnmatch`` pattern such as ``finance_*``) and
+``role``:
+
+.. code-block:: json
+
+  {
+    "Finance Ops": [{"dags": "finance_*", "role": "USER"}],
+    "Finance Auditors": [{"dags": "finance_*", "role": "VIEWER"}],
+    "Payroll Admins": [{"dags": "payroll_export", "role": "OP"}]
+  }
+
+* The role on a Dag is the highest of the global role, the team role and the matching grants. Grants
+  only add access. Give users with Dag grants no global role, or they see every Dag of no team.
+* Users with only Dag grants see those Dags and nothing else: no connections, variables, pools, assets
+  or configuration.
+* Patterns match the Dag ID, which Dag authors choose. In multi-team mode, add ``"team"`` to a grant: it
+  then only applies to the Dags of that team's bundles, so a Dag added by another team cannot match it.
+  A grant without ``team`` applies to Dags of no team only.
+* Grants are checked on every request against the configuration loaded by the API server, without
+  calling AD FS: removing a grant takes effect when the API server restarts, without users logging in
+  again. A user gets a newly added grant at their next login.
+
 .. _adfs-multi-team:
 
 Multi-team

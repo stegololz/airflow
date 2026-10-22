@@ -81,6 +81,8 @@ Other options
   are unique across the domains trusted by AD FS.
 * ``roles_claims``: claims holding the values matched against ``role_mapping`` and
   ``team_role_mapping``.
+* ``dag_role_mapping``: a JSON object mapping group or role claim values to roles on some Dags, see
+  :ref:`Dag grants <adfs-dag-grants>`.
 * ``team_role_mapping``: in multi-team mode, a JSON object mapping group or role claim values to a
   role in a team, see :ref:`multi-team <adfs-multi-team>`.
 * ``default_role``: role given to users matching no entry of ``role_mapping``. When empty, they are

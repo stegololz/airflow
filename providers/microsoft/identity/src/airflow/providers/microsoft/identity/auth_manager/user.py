@@ -31,12 +31,14 @@ class AdfsAuthManagerUser(BaseModel, BaseUser):
     :param name: display name of the user
     :param role: global Airflow role resolved from the group or role claims at login, if any
     :param teams: Airflow role of the user in each team, in multi-team mode
+    :param dag_groups: case-folded claim values of the user that have Dag grants in ``dag_role_mapping``
     """
 
     user_id: str
     name: str
     role: AdfsAuthManagerRole | None
     teams: dict[str, AdfsAuthManagerRole] = {}
+    dag_groups: list[str] = []
 
     def get_id(self) -> str:
         return self.user_id
