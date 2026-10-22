@@ -113,8 +113,8 @@ config:
       roles_claims:
         description: |
           Comma-separated list of claims holding the group or role values matched against
-          ``role_mapping``. Values of all listed claims are combined. Each claim may hold a single
-          string or a list of strings.
+          ``role_mapping``, ``team_role_mapping`` and ``resource_role_mapping``. Values of all listed
+          claims are combined. Each claim may hold a single string or a list of strings.
         type: string
         version_added: 0.1.0
         example: ~
@@ -123,8 +123,8 @@ config:
         description: |
           JSON object mapping group or role claim values to global Airflow roles. Keys are matched
           case-insensitively. Allowed roles are ``VIEWER``, ``USER``, ``OP`` and ``ADMIN``. When several
-          values match, the highest role is used. Optional in multi-team mode when
-          ``team_role_mapping`` is set.
+          values match, the highest role is used. Optional when ``team_role_mapping`` or
+          ``resource_role_mapping`` is set.
         type: string
         version_added: 0.1.0
         example: '{"Airflow Admins": "ADMIN", "Airflow Operators": "OP", "Airflow Users": "USER"}'
@@ -139,18 +139,23 @@ config:
         version_added: 0.1.0
         example: '{"Airflow team-a Operators": "team-a:OP", "Airflow team-b Viewers": "team-b:VIEWER"}'
         default: ""
-      dag_role_mapping:
+      resource_role_mapping:
         description: |
-          JSON object mapping group or role claim values to lists of Dag grants, each an object with
-          ``dags`` (a Dag ID or an ``fnmatch`` pattern, matched case-sensitively), ``role`` and, in
-          multi-team mode, ``team``. A grant only applies to the Dags of its team, or to Dags of no team
-          when ``team`` is omitted. Grants add to the global and team roles and never remove access.
-          Grants are loaded when the API server starts. After a restart, changed or removed grants
-          apply to every session, current ones included. A claim value the user did not have when
-          logging in only counts after their next login.
+          JSON object mapping group or role claim values to lists of grants. Each grant is an object
+          with exactly one of ``dags``, ``connections``, ``variables`` or ``pools`` (an ID or an
+          ``fnmatch`` pattern, matched case-sensitively), a ``role`` and, in multi-team mode, a
+          ``team``. A grant only applies to the resources of its team, or to resources of no team when
+          ``team`` is omitted. Grants add to the global and team roles and never remove access.
+          Connection and variable grants need the ``OP`` or ``ADMIN`` role. Grants on connections,
+          variables and pools require Airflow 3.2.0 or later. Grants are loaded when the API server
+          starts. After a restart, changed or removed grants apply to every session, current ones
+          included. A claim value the user did not have when logging in only counts after their next
+          login.
         type: string
         version_added: 0.1.0
-        example: '{"Finance Ops": [{"dags": "finance_*", "role": "USER"}]}'
+        example: >-
+          {"Finance Ops": [{"dags": "finance_*", "role": "USER"},
+          {"connections": "finance_*", "role": "OP"}]}
         default: ""
       default_role:
         description: |

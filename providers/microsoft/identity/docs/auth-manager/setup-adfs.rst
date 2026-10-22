@@ -85,10 +85,11 @@ The rules must issue:
   as ``Surname``), used as the display name. AD FS issues the ``Name`` claim type as ``unique_name``,
   which is a user name claim: do not send a display name as ``Name``.
 
-Issue only the groups used in ``role_mapping``. Airflow keeps the ID token in a cookie to send it back
-to AD FS at logout, and does not keep an ID token longer than 3800 characters, which is reached with
-about 60 group names. AD FS then does not redirect the user back to Airflow after logout, and a warning
-is logged at login.
+Issue only the groups used in ``role_mapping``, ``team_role_mapping`` and
+``resource_role_mapping``. Airflow keeps the ID token in a cookie to send it back to AD FS at logout,
+and does not keep an ID token longer than 3800 characters, which is reached with about 60 group
+names. AD FS then does not redirect the user back to Airflow after logout, and a warning is logged at
+login.
 
 Example of rules sending the user principal name and the groups whose name starts with ``Airflow``
 as roles:

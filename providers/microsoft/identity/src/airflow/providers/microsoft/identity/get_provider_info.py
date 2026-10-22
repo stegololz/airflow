@@ -98,14 +98,14 @@ def get_provider_info():
                         "default": "False",
                     },
                     "roles_claims": {
-                        "description": "Comma-separated list of claims holding the group or role values matched against\n``role_mapping``. Values of all listed claims are combined. Each claim may hold a single\nstring or a list of strings.\n",
+                        "description": "Comma-separated list of claims holding the group or role values matched against\n``role_mapping``, ``team_role_mapping`` and ``resource_role_mapping``. Values of all listed\nclaims are combined. Each claim may hold a single string or a list of strings.\n",
                         "type": "string",
                         "version_added": "0.1.0",
                         "example": None,
                         "default": "role,roles,group,groups,http://schemas.microsoft.com/ws/2008/06/identity/claims/role",
                     },
                     "role_mapping": {
-                        "description": "JSON object mapping group or role claim values to global Airflow roles. Keys are matched\ncase-insensitively. Allowed roles are ``VIEWER``, ``USER``, ``OP`` and ``ADMIN``. When several\nvalues match, the highest role is used. Optional in multi-team mode when\n``team_role_mapping`` is set.\n",
+                        "description": "JSON object mapping group or role claim values to global Airflow roles. Keys are matched\ncase-insensitively. Allowed roles are ``VIEWER``, ``USER``, ``OP`` and ``ADMIN``. When several\nvalues match, the highest role is used. Optional when ``team_role_mapping`` or\n``resource_role_mapping`` is set.\n",
                         "type": "string",
                         "version_added": "0.1.0",
                         "example": '{"Airflow Admins": "ADMIN", "Airflow Operators": "OP", "Airflow Users": "USER"}',
@@ -118,11 +118,11 @@ def get_provider_info():
                         "example": '{"Airflow team-a Operators": "team-a:OP", "Airflow team-b Viewers": "team-b:VIEWER"}',
                         "default": "",
                     },
-                    "dag_role_mapping": {
-                        "description": "JSON object mapping group or role claim values to lists of Dag grants, each an object with\n``dags`` (a Dag ID or an ``fnmatch`` pattern, matched case-sensitively), ``role`` and, in\nmulti-team mode, ``team``. A grant only applies to the Dags of its team, or to Dags of no team\nwhen ``team`` is omitted. Grants add to the global and team roles and never remove access.\nGrants are loaded when the API server starts. After a restart, changed or removed grants\napply to every session, current ones included. A claim value the user did not have when\nlogging in only counts after their next login.\n",
+                    "resource_role_mapping": {
+                        "description": "JSON object mapping group or role claim values to lists of grants. Each grant is an object\nwith exactly one of ``dags``, ``connections``, ``variables`` or ``pools`` (an ID or an\n``fnmatch`` pattern, matched case-sensitively), a ``role`` and, in multi-team mode, a\n``team``. A grant only applies to the resources of its team, or to resources of no team when\n``team`` is omitted. Grants add to the global and team roles and never remove access.\nConnection and variable grants need the ``OP`` or ``ADMIN`` role. Grants on connections,\nvariables and pools require Airflow 3.2.0 or later. Grants are loaded when the API server\nstarts. After a restart, changed or removed grants apply to every session, current ones\nincluded. A claim value the user did not have when logging in only counts after their next\nlogin.\n",
                         "type": "string",
                         "version_added": "0.1.0",
-                        "example": '{"Finance Ops": [{"dags": "finance_*", "role": "USER"}]}',
+                        "example": '{"Finance Ops": [{"dags": "finance_*", "role": "USER"}, {"connections": "finance_*", "role": "OP"}]}',
                         "default": "",
                     },
                     "default_role": {

@@ -20,7 +20,8 @@ Permissions
 ===========
 
 Each user has a global Airflow role and, in :ref:`multi-team <adfs-multi-team>` mode, a role per team,
-resolved at login from the group or role claims issued by AD FS.
+and optionally roles on some Dags, connections, variables and pools, resolved at login from the group
+or role claims issued by AD FS.
 
 Role mapping
 ------------
@@ -61,34 +62,65 @@ Plugin views                                       ``VIEWER``   ``OP``
 =================================================  ===========  =============================
 
 The cluster activity, documentation, import errors, jobs, plugins, providers, triggers and website
-views are available to every role. Any other view, such as the audit log, import errors and reparsing
-of files not tied to a Dag, requires ``ADMIN``. The Connections and Variables menu entries are shown
-to ``OP`` and ``ADMIN`` only.
+views are available to every role. Any other view requires ``ADMIN``. Up to Airflow 3.3, audit log
+entries and import errors that are not tied to a Dag are shown to every role, users with only Dag
+grants included; later versions require ``ADMIN`` for them. The Connections and Variables menu entries
+are shown to ``OP`` and ``ADMIN``, and to users with grants on connections or variables.
 
-.. _adfs-dag-grants:
+.. _adfs-resource-grants:
 
-Dag grants
-----------
+Resource grants
+---------------
 
-``[adfs_auth_manager] dag_role_mapping`` gives users a role on some Dags only. It maps claim values to
-lists of grants, each with ``dags`` (a Dag ID, or an ``fnmatch`` pattern such as ``finance_*``) and
-``role``:
+``[adfs_auth_manager] resource_role_mapping`` gives users a role on some Dags, connections, variables
+or pools only. It maps claim values to lists of grants. Each grant names one kind of resource with
+``dags``, ``connections``, ``variables`` or ``pools`` (an ID, or an ``fnmatch`` pattern such as
+``finance_*``), and a ``role``:
 
 .. code-block:: json
 
   {
-    "Finance Ops": [{"dags": "finance_*", "role": "USER"}],
-    "Finance Auditors": [{"dags": "finance_*", "role": "VIEWER"}],
-    "Payroll Admins": [{"dags": "payroll_export", "role": "OP"}]
+    "Finance Ops": [
+      {"dags": "finance_*", "role": "USER"},
+      {"connections": "finance_*", "role": "OP"},
+      {"variables": "finance_*", "role": "OP"},
+      {"pools": "finance", "role": "OP"}
+    ],
+    "Finance Auditors": [{"dags": "finance_*", "role": "VIEWER"}]
   }
 
-* The role on a Dag is the highest of the global role, the team role and the matching grants. Grants
-  only add access. Give users with Dag grants no global role, or they see every Dag of no team.
-* Users with only Dag grants see those Dags and nothing else: no connections, variables, pools, assets
-  or configuration.
-* Patterns match the Dag ID, which Dag authors choose. In multi-team mode, add ``"team"`` to a grant: it
-  then only applies to the Dags of that team's bundles, so a Dag added by another team cannot match it.
-  A grant without ``team`` applies to Dags of no team only.
+* The role on a resource is the highest of the global role, the team role and the matching grants of
+  that kind. Grants only add access. Give users with grants no global role, or they see every Dag of
+  no team. The permissions of each role are the ones in the table above: connections and variables
+  need ``OP``, so their grants must have the ``OP`` or ``ADMIN`` role.
+* Grants let users read, change and delete the matching resources, and create them through the bulk
+  endpoints, which name each resource. In multi-team mode, the bulk endpoints check a new resource
+  as a resource of no team, so only grants without ``team`` can create through them. Requests that do
+  not name the resource, such as creating a single connection, variable or pool, and triggering a
+  backfill before Airflow 3.1.8, are only allowed by the global and team roles. Lists show the matching
+  resources only.
+* Grants on connections, variables and pools require Airflow 3.2.0 or later: earlier versions do not
+  filter these lists per resource, and the API server refuses to start with such grants.
+* Users with only grants see the matching resources and their menu entries, the views available to
+  every role (cluster activity, documentation, import errors, jobs, plugins, providers, triggers and
+  website) and, before Airflow 3.4, the audit log entries not tied to a Dag. Jobs and triggers are not
+  filtered per Dag. They get no assets, configuration, plugin actions or other connections, variables
+  and pools.
+* Patterns match the Dag ID, connection ID, variable key or pool name, case-sensitively. On MySQL,
+  connection IDs, variable keys and pool names are looked up with the database collation, which is
+  often case-insensitive: a pattern then also covers names that differ from a match only by case.
+* In multi-team mode, add ``"team"`` to a grant: it then only applies to that team's resources, so a
+  resource added by another team cannot match it. A grant without ``team`` applies to resources of no
+  team only.
+* Before Airflow 3.3.0, with ``[core] multi_team`` enabled, the bulk endpoints of connections, variables
+  and pools do not check the team of an existing resource they create over, or the destination team.
+  A grant without ``team`` can then reach another team's resource whose ID matches its pattern: bind
+  grants to a team, or use Airflow 3.3.0 or later. A grant can also move a matching resource to
+  another team, which only Airflow 3.3.0 or later prevents.
+* On every Airflow version, with ``[core] multi_team`` enabled, a bulk update, or a bulk create that
+  overwrites, which sets ``team_name`` to ``null`` is only checked against the current team of the
+  resource. A grant bound to a team, like a role in that team, can thus move the team's matching
+  connections, variables and pools to no team, where every team can use them.
 * Grants are checked in memory, without calling AD FS, against the configuration loaded when the API
   server starts. After a restart, changed or removed grants apply to every session, current ones
   included. A claim value the user did not have when logging in, such as a group they were just added
@@ -119,8 +151,11 @@ used. ``role_mapping`` stays optional and gives the global role.
   authorized with the global role. Members of a team without a global role can read them as
   ``VIEWER``.
 * Menu entries, list pages and plugin views use the highest role of the user, global or in a team;
-  the rows listed are still filtered per team. Plugin actions that change state need a global role.
+  the rows listed are still filtered per team. Grants add the menu entries of their kind (see
+  :ref:`resource grants <adfs-resource-grants>`). Plugin actions that change state need a global role.
 * Team members can read their team's plugin APIs; changing state through them needs ``OP`` in the
   team.
-* The teams listed in ``team_role_mapping`` must exist in Airflow (``airflow teams create``).
-  Differences are logged as warnings when the API server starts.
+* The teams named in ``team_role_mapping`` and ``resource_role_mapping`` must exist in Airflow
+  (``airflow teams create``). From Airflow 3.2, the API server compares them with the teams in the
+  database when it starts. Depending on the Airflow version, a team missing from the database stops
+  the API server or is reported as a warning.

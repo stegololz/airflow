@@ -35,13 +35,13 @@ from airflow.providers.microsoft.identity.auth_manager.constants import (
     CONF_CA_BUNDLE_PATH_KEY,
     CONF_CLIENT_ID_KEY,
     CONF_CLIENT_SECRET_KEY,
-    CONF_DAG_ROLE_MAPPING_KEY,
     CONF_DEFAULT_ROLE_KEY,
     CONF_ISSUER_KEY,
     CONF_JWKS_CACHE_TTL_SECONDS_KEY,
     CONF_LEEWAY_SECONDS_KEY,
     CONF_REQUEST_TIMEOUT_SECONDS_KEY,
     CONF_RESOURCE_KEY,
+    CONF_RESOURCE_ROLE_MAPPING_KEY,
     CONF_ROLE_MAPPING_KEY,
     CONF_ROLES_CLAIMS_KEY,
     CONF_SCOPE_KEY,
@@ -56,19 +56,22 @@ from airflow.providers.microsoft.identity.auth_manager.constants import (
 from airflow.providers.microsoft.identity.auth_manager.oidc import AdfsOidcClient
 from airflow.providers.microsoft.identity.auth_manager.roles import (
     AdfsAuthManagerRole,
-    DagGrant,
+    ResourceGrant,
+    ResourceKind,
     get_claim_values,
-    get_dag_role,
+    get_grant_role,
+    get_highest_grant_role,
     get_role_by_name,
-    parse_dag_role_mapping,
+    parse_resource_role_mapping,
     parse_role_mapping,
     parse_team_role_mapping,
-    resolve_dag_groups,
+    resolve_grant_groups,
     resolve_role,
     resolve_team_roles,
     resolve_username,
 )
 from airflow.providers.microsoft.identity.auth_manager.user import AdfsAuthManagerUser
+from airflow.providers.microsoft.identity.version_compat import AIRFLOW_V_3_2_PLUS
 
 if TYPE_CHECKING:
     from airflow.api_fastapi.auth.managers.base_auth_manager import ResourceMethod
@@ -112,6 +115,20 @@ MENU_ITEM_MIN_ROLES: dict[str, AdfsAuthManagerRole] = {
     "Variables": AdfsAuthManagerRole.OP,
 }
 
+# Menu items of the pages that grants of each kind give access to, keyed by ``MenuItem`` value because
+# older Airflow versions lack some members.
+GRANT_MENU_ITEMS: dict[ResourceKind, frozenset[str]] = {
+    ResourceKind.DAGS: frozenset(
+        {"Audit Log", "Dag Bundles", "Dags", "Deadlines", "Required Actions", "XComs"}
+    ),
+    ResourceKind.CONNECTIONS: frozenset({"Connections"}),
+    ResourceKind.VARIABLES: frozenset({"Variables"}),
+    ResourceKind.POOLS: frozenset({"Pools"}),
+}
+
+# Menu items of views that ``is_authorized_view`` opens to every user (see ``VIEWER_ACCESS_VIEW_NAMES``).
+OPEN_MENU_ITEMS = frozenset({"Docs", "Jobs", "Plugins", "Providers"})
+
 
 def _get_team_name(details: Any) -> str | None:
     # ``team_name`` is missing from resource details in older Airflow versions.
@@ -152,11 +169,11 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             )
         if not any(
             conf.get(CONF_SECTION_NAME, key, fallback=None)
-            for key in (CONF_ROLE_MAPPING_KEY, CONF_TEAM_ROLE_MAPPING_KEY, CONF_DAG_ROLE_MAPPING_KEY)
+            for key in (CONF_ROLE_MAPPING_KEY, CONF_TEAM_ROLE_MAPPING_KEY, CONF_RESOURCE_ROLE_MAPPING_KEY)
         ):
             raise ValueError(
                 f"[{CONF_SECTION_NAME}] {CONF_ROLE_MAPPING_KEY}, {CONF_TEAM_ROLE_MAPPING_KEY} or "
-                f"{CONF_DAG_ROLE_MAPPING_KEY} must be set"
+                f"{CONF_RESOURCE_ROLE_MAPPING_KEY} must be set"
             )
         if urlsplit(conf.get(CONF_SECTION_NAME, CONF_ISSUER_KEY)).scheme != "https":
             raise ValueError(f"[{CONF_SECTION_NAME}] {CONF_ISSUER_KEY} must be an https URL")
@@ -166,7 +183,7 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         # rather than at the first login.
         self.get_role_mapping()
         self.get_team_role_mapping()
-        self.get_dag_role_mapping()
+        self.get_resource_role_mapping()
         self.get_default_role()
 
     @cached_property
@@ -199,11 +216,23 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         return parse_team_role_mapping(raw) if raw else {}
 
     @cached_property
-    def _dag_role_mapping(self) -> dict[str, list[DagGrant]]:
-        raw = conf.get(CONF_SECTION_NAME, CONF_DAG_ROLE_MAPPING_KEY, fallback="") or ""
+    def _resource_role_mapping(self) -> dict[str, list[ResourceGrant]]:
+        raw = conf.get(CONF_SECTION_NAME, CONF_RESOURCE_ROLE_MAPPING_KEY, fallback="") or ""
         if not raw:
             return {}
-        return parse_dag_role_mapping(raw, multi_team=conf.getboolean("core", "multi_team", fallback=False))
+        mapping = parse_resource_role_mapping(
+            raw, multi_team=conf.getboolean("core", "multi_team", fallback=False)
+        )
+        # Before Airflow 3.2.0, core does not filter lists of connections, variables and pools per
+        # resource, and does not check every resource and team written by bulk and ``PATCH`` requests.
+        if not AIRFLOW_V_3_2_PLUS and any(
+            grant.kind != ResourceKind.DAGS for grants in mapping.values() for grant in grants
+        ):
+            raise ValueError(
+                f"[{CONF_SECTION_NAME}] {CONF_RESOURCE_ROLE_MAPPING_KEY} grants on connections, variables or "
+                "pools require Airflow 3.2.0 or later"
+            )
+        return mapping
 
     @cached_property
     def _default_role(self) -> AdfsAuthManagerRole | None:
@@ -222,9 +251,9 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         """Return the mapping of case-folded group or role claim values to ``(team, role)`` tuples."""
         return self._team_role_mapping
 
-    def get_dag_role_mapping(self) -> dict[str, list[DagGrant]]:
-        """Return the mapping of case-folded group or role claim values to their Dag grants."""
-        return self._dag_role_mapping
+    def get_resource_role_mapping(self) -> dict[str, list[ResourceGrant]]:
+        """Return the mapping of case-folded group or role claim values to their resource grants."""
+        return self._resource_role_mapping
 
     def get_default_role(self) -> AdfsAuthManagerRole | None:
         """Return the role of users whose claims do not match the role mapping, if any."""
@@ -246,8 +275,8 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         values = get_claim_values(claims, _get_list_option(CONF_ROLES_CLAIMS_KEY, DEFAULT_ROLES_CLAIMS))
         role = resolve_role(values, self.get_role_mapping(), self.get_default_role())
         teams = resolve_team_roles(values, self.get_team_role_mapping())
-        dag_groups = resolve_dag_groups(values, self.get_dag_role_mapping())
-        if role is None and not teams and not dag_groups:
+        grant_groups = resolve_grant_groups(values, self.get_resource_role_mapping())
+        if role is None and not teams and not grant_groups:
             # Logged so that a renamed or missing group in AD FS can be diagnosed.
             log.info("User %s has no Airflow role; unmapped claim values: %s", username, values)
             raise PermissionError(f"User {username} is not mapped to an Airflow role")
@@ -256,7 +285,7 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             name=self._get_display_name(claims, username),
             role=role,
             teams=teams,
-            dag_groups=dag_groups,
+            grant_groups=grant_groups,
         )
 
     @staticmethod
@@ -278,7 +307,7 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             teams={team: AdfsAuthManagerRole[name] for team, name in token.get("teams", {}).items()}
             if conf.getboolean("core", "multi_team", fallback=False)
             else {},
-            dag_groups=list(token.get("dag_groups", [])),
+            grant_groups=list(token.get("grant_groups", [])),
         )
 
     def serialize_user(self, user: AdfsAuthManagerUser) -> dict[str, Any]:
@@ -287,7 +316,7 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             "name": user.name,
             "role": user.role.name if user.role is not None else None,
             "teams": {team: role.name for team, role in user.teams.items()},
-            "dag_groups": user.dag_groups,
+            "grant_groups": user.grant_groups,
         }
 
     def get_url_login(self, **kwargs) -> str:
@@ -324,6 +353,13 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             write_role=AdfsAuthManagerRole.OP,
             team_name=_get_team_name(details),
             any_team=method == "GET" and (details is None or details.conn_id is None),
+            grant_role=self._get_grant_role(
+                user,
+                ResourceKind.CONNECTIONS,
+                method=method,
+                resource_id=details.conn_id if details is not None else None,
+                team_name=_get_team_name(details),
+            ),
         )
 
     def is_authorized_dag(
@@ -335,16 +371,15 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         details: DagDetails | None = None,
     ) -> bool:
         team_name = _get_team_name(details)
-        if details is None or details.id is None:
-            # Lists are filtered per Dag by core. Writes naming no Dag are not re-checked per Dag by every
-            # supported Airflow version (backfills before 3.1.8), so Dag grants never authorize them.
-            role = self._get_highest_role(user, include_dag_grants=method == "GET")
+        dag_id = details.id if details is not None else None
+        grant_role = self._get_grant_role(
+            user, ResourceKind.DAGS, method=method, resource_id=dag_id, team_name=team_name
+        )
+        if dag_id is None:
+            roles = [self._get_highest_role(user), grant_role]
         else:
-            roles = [
-                self._get_role(user, team_name),
-                get_dag_role(user.dag_groups, self.get_dag_role_mapping(), details.id, team_name),
-            ]
-            role = max((r for r in roles if r is not None), default=None)
+            roles = [self._get_role(user, team_name), grant_role]
+        role = max((r for r in roles if r is not None), default=None)
         required_role = AdfsAuthManagerRole.VIEWER if method == "GET" else AdfsAuthManagerRole.USER
         return role is not None and role >= required_role
 
@@ -386,6 +421,13 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             read_role=AdfsAuthManagerRole.VIEWER,
             write_role=AdfsAuthManagerRole.OP,
             team_name=_get_team_name(details),
+            grant_role=self._get_grant_role(
+                user,
+                ResourceKind.POOLS,
+                method=method,
+                resource_id=details.name if details is not None else None,
+                team_name=_get_team_name(details),
+            ),
         )
 
     def is_authorized_team(
@@ -411,6 +453,13 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             write_role=AdfsAuthManagerRole.OP,
             team_name=_get_team_name(details),
             any_team=method == "GET" and (details is None or details.key is None),
+            grant_role=self._get_grant_role(
+                user,
+                ResourceKind.VARIABLES,
+                method=method,
+                resource_id=details.key if details is not None else None,
+                team_name=_get_team_name(details),
+            ),
         )
 
     def is_authorized_view(
@@ -434,13 +483,25 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
     def filter_authorized_menu_items(
         self, menu_items: list[MenuItem], *, user: AdfsAuthManagerUser
     ) -> list[MenuItem]:
-        role = self._get_highest_role(user, include_dag_grants=True)
-        if role is None:
-            return []
+        role = self._get_highest_role(user)
+        mapping = self.get_resource_role_mapping()
+        # Grants only add the menu items of the pages of their kind, which the API lets them use.
+        granted = {
+            item
+            for kind, items in GRANT_MENU_ITEMS.items()
+            if get_highest_grant_role(user.grant_groups, mapping, kind) is not None
+            for item in items
+        }
+        if granted:
+            granted |= OPEN_MENU_ITEMS
         return [
             menu_item
             for menu_item in menu_items
-            if role >= MENU_ITEM_MIN_ROLES.get(menu_item.value, AdfsAuthManagerRole.VIEWER)
+            if (
+                role is not None
+                and role >= MENU_ITEM_MIN_ROLES.get(menu_item.value, AdfsAuthManagerRole.VIEWER)
+            )
+            or menu_item.value in granted
         ]
 
     def get_fastapi_app(self) -> FastAPI | None:
@@ -458,10 +519,13 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         return app
 
     def _get_teams(self) -> set[str]:
-        dag_teams = {
-            grant.team for grants in self.get_dag_role_mapping().values() for grant in grants if grant.team
+        grant_teams = {
+            grant.team
+            for grants in self.get_resource_role_mapping().values()
+            for grant in grants
+            if grant.team
         }
-        return {team for team, _ in self.get_team_role_mapping().values()} | dag_teams
+        return {team for team, _ in self.get_team_role_mapping().values()} | grant_teams
 
     @staticmethod
     def _get_role(user: AdfsAuthManagerUser, team_name: str | None) -> AdfsAuthManagerRole | None:
@@ -481,19 +545,41 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             return user.role
         return AdfsAuthManagerRole.VIEWER if user.teams else None
 
-    def _get_highest_role(
-        self, user: AdfsAuthManagerUser, *, include_dag_grants: bool = False
-    ) -> AdfsAuthManagerRole | None:
+    @staticmethod
+    def _get_highest_role(user: AdfsAuthManagerUser) -> AdfsAuthManagerRole | None:
         """
-        Return the highest role of the user, global or in a team, and optionally from Dag grants.
+        Return the highest role of the user, global or in a team.
 
         :meta private:
         """
         roles = [role for role in (user.role, *user.teams.values()) if role is not None]
-        if include_dag_grants:
-            mapping = self.get_dag_role_mapping()
-            roles.extend(grant.role for group in user.dag_groups for grant in mapping.get(group, ()))
         return max(roles) if roles else None
+
+    def _get_grant_role(
+        self,
+        user: AdfsAuthManagerUser,
+        kind: ResourceKind,
+        *,
+        method: ResourceMethod,
+        resource_id: str | None,
+        team_name: str | None,
+    ) -> AdfsAuthManagerRole | None:
+        """
+        Return the highest role the user's grants of a kind give for a check, if any.
+
+        A check naming no resource only counts grants for ``GET``: core filters the listed resources one
+        by one afterwards. Writes naming no resource (creation from a request body, bulk changes before
+        Airflow 3.1, backfills before 3.1.8) are not checked again per resource by every supported Airflow
+        version, so grants never authorize them.
+
+        :meta private:
+        """
+        mapping = self.get_resource_role_mapping()
+        if resource_id is not None:
+            return get_grant_role(user.grant_groups, mapping, kind, resource_id, team_name)
+        if method == "GET":
+            return get_highest_grant_role(user.grant_groups, mapping, kind)
+        return None
 
     def _is_authorized(
         self,
@@ -504,6 +590,7 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         write_role: AdfsAuthManagerRole,
         team_name: str | None = None,
         any_team: bool = False,
+        grant_role: AdfsAuthManagerRole | None = None,
     ) -> bool:
         """
         Return whether the user's role on the resource grants the method.
@@ -515,7 +602,10 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         :param team_name: team of the resource, if any
         :param any_team: whether the check covers resources of any team, filtered per team by core
             afterwards, in which case the highest role of the user applies
+        :param grant_role: highest role the user's grants give for the check, if any, added to the role
+            of the user
         :meta private:
         """
         role = self._get_highest_role(user) if any_team and not team_name else self._get_role(user, team_name)
+        role = max((r for r in (role, grant_role) if r is not None), default=None)
         return role is not None and role >= (read_role if method == "GET" else write_role)

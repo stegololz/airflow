@@ -63,6 +63,7 @@ from airflow.providers.microsoft.identity.auth_manager.roles import AdfsAuthMana
 from airflow.providers.microsoft.identity.auth_manager.user import AdfsAuthManagerUser
 
 from tests_common.test_utils.config import conf_vars
+from tests_common.test_utils.version_compat import AIRFLOW_V_3_4_PLUS
 from unit.microsoft.identity.auth_manager.adfs_fixtures import AUTH_MANAGER_CONF, CLIENT_ID, ISSUER
 
 VIEWER = AdfsAuthManagerRole.VIEWER
@@ -226,7 +227,7 @@ class TestAdfsAuthManager:
             "name": "John Doe",
             "role": "OP",
             "teams": {},
-            "dag_groups": [],
+            "grant_groups": [],
         }
         assert auth_manager.deserialize_user(serialized) == user
 
@@ -241,7 +242,7 @@ class TestAdfsAuthManager:
             "name": "John Doe",
             "role": None,
             "teams": {"team_a": "OP", "team_b": "VIEWER"},
-            "dag_groups": [],
+            "grant_groups": [],
         }
         assert auth_manager.deserialize_user(serialized) == user
 
@@ -382,14 +383,18 @@ class TestAdfsAuthManager:
         "airflow.api_fastapi.auth.managers.base_auth_manager.Team.get_all_team_names",
         return_value={"team_a", "team_c"},
     )
-    def test_init_multi_team_warns_on_team_mismatch(self, _, multi_team_auth_manager):
-        with pytest.warns(UserWarning, match="Teams defined") as record:
-            multi_team_auth_manager.init()
+    def test_init_multi_team_reports_team_mismatch(self, _, multi_team_auth_manager):
+        if AIRFLOW_V_3_4_PLUS:
+            with pytest.warns(UserWarning, match="Teams defined") as record:
+                multi_team_auth_manager.init()
 
-        assert [str(w.message) for w in record] == [
-            "Teams defined in the auth manager are not present in the database ({'team_b'}).",
-            "Teams defined in the database are not present in the auth manager ({'team_c'}).",
-        ]
+            assert [str(w.message) for w in record] == [
+                "Teams defined in the auth manager are not present in the database ({'team_b'}).",
+                "Teams defined in the database are not present in the auth manager ({'team_c'}).",
+            ]
+        else:
+            with pytest.raises(ValueError, match="Teams defined in the auth manager"):
+                multi_team_auth_manager.init()
 
     def test_get_teams(self, multi_team_auth_manager):
         assert multi_team_auth_manager._get_teams() == {"team_a", "team_b"}

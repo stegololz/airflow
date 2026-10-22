@@ -23,7 +23,7 @@ import fnmatch
 import json
 import logging
 from collections.abc import Mapping, Sequence
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Any, NamedTuple
 
 from airflow.providers.microsoft.identity.auth_manager.oidc import AdfsAuthenticationError
@@ -138,99 +138,154 @@ def resolve_team_roles(
     return teams
 
 
-class DagGrant(NamedTuple):
-    """
-    Role given on the Dags whose ID matches a pattern.
+class ResourceKind(Enum):
+    """Kind of resource a grant applies to; the value is its key in ``resource_role_mapping``."""
 
-    :param dags: ``fnmatch`` pattern matched case-sensitively against the Dag ID
-    :param role: role given on the matching Dags
-    :param team: team the matching Dags must belong to, or ``None`` for Dags of no team
+    DAGS = "dags"
+    CONNECTIONS = "connections"
+    VARIABLES = "variables"
+    POOLS = "pools"
+
+
+# Lowest role that gives any access to a resource of each kind: a grant below it would give nothing.
+MIN_GRANT_ROLES: dict[ResourceKind, AdfsAuthManagerRole] = {
+    ResourceKind.DAGS: AdfsAuthManagerRole.VIEWER,
+    ResourceKind.CONNECTIONS: AdfsAuthManagerRole.OP,
+    ResourceKind.VARIABLES: AdfsAuthManagerRole.OP,
+    ResourceKind.POOLS: AdfsAuthManagerRole.VIEWER,
+}
+
+
+class ResourceGrant(NamedTuple):
+    """
+    Role given on the resources of one kind whose ID matches a pattern.
+
+    :param kind: kind of the resources
+    :param pattern: ``fnmatch`` pattern matched case-sensitively against the Dag ID, connection ID,
+        variable key or pool name
+    :param role: role given on the matching resources
+    :param team: team the matching resources must belong to, or ``None`` for resources of no team
     """
 
-    dags: str
+    kind: ResourceKind
+    pattern: str
     role: AdfsAuthManagerRole
     team: str | None
 
 
-_DAG_GRANT_KEYS = frozenset({"dags", "role", "team"})
+_GRANT_KIND_KEYS = frozenset(kind.value for kind in ResourceKind)
+_GRANT_KEYS = _GRANT_KIND_KEYS | {"role", "team"}
 
 
-def parse_dag_role_mapping(raw: str, *, multi_team: bool) -> dict[str, list[DagGrant]]:
+def parse_resource_role_mapping(raw: str, *, multi_team: bool) -> dict[str, list[ResourceGrant]]:
     """
-    Parse the ``dag_role_mapping`` option.
+    Parse the ``resource_role_mapping`` option.
 
-    :param raw: JSON object mapping claim values to lists of ``{"dags", "role", "team"}`` objects
+    :param raw: JSON object mapping claim values to lists of grants, each an object with one of
+        ``dags``, ``connections``, ``variables`` or ``pools``, a ``role`` and an optional ``team``
     :param multi_team: whether multi-team mode is enabled; ``team`` is only allowed then
-    :return: mapping of case-folded claim values to their Dag grants
+    :return: mapping of case-folded claim values to their resource grants
     """
     try:
         loaded = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise ValueError(f"dag_role_mapping is not valid JSON: {e.msg} (position {e.pos})") from None
+        raise ValueError(f"resource_role_mapping is not valid JSON: {e.msg} (position {e.pos})") from None
     if not isinstance(loaded, dict):
-        raise ValueError("dag_role_mapping must be a JSON object")
-    mapping: dict[str, list[DagGrant]] = {}
+        raise ValueError("resource_role_mapping must be a JSON object")
+    mapping: dict[str, list[ResourceGrant]] = {}
     for key, rules in loaded.items():
         if not isinstance(rules, list) or not rules:
-            raise ValueError(f"The value of dag_role_mapping key {key!r} must be a non-empty list")
+            raise ValueError(f"The value of resource_role_mapping key {key!r} must be a non-empty list")
         grants = []
         for rule in rules:
-            if not isinstance(rule, dict) or not {"dags", "role"} <= rule.keys() <= _DAG_GRANT_KEYS:
+            kind_keys = rule.keys() & _GRANT_KIND_KEYS if isinstance(rule, dict) else set()
+            if len(kind_keys) != 1 or "role" not in rule or not rule.keys() <= _GRANT_KEYS:
                 raise ValueError(
-                    f"Each rule of dag_role_mapping key {key!r} must be an object with 'dags', 'role' "
-                    "and an optional 'team'"
+                    f"Each grant of resource_role_mapping key {key!r} must be an object with one of 'dags', "
+                    "'connections', 'variables' or 'pools', a 'role' and an optional 'team'"
                 )
-            dags, team = rule["dags"], rule.get("team")
-            if not isinstance(dags, str) or not dags.strip():
-                raise ValueError(f"The 'dags' of dag_role_mapping key {key!r} must be a non-empty string")
+            kind = ResourceKind(kind_keys.pop())
+            pattern, team = rule[kind.value], rule.get("team")
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError(
+                    f"The {kind.value!r} of resource_role_mapping key {key!r} must be a non-empty string"
+                )
             if team is not None and (not multi_team or not isinstance(team, str) or not team.strip()):
                 raise ValueError(
-                    f"The 'team' of dag_role_mapping key {key!r} must be a team name and requires "
+                    f"The 'team' of resource_role_mapping key {key!r} must be a team name and requires "
                     "[core] multi_team"
                 )
             if not isinstance(rule["role"], str):
-                raise ValueError(f"The 'role' of dag_role_mapping key {key!r} must be a string")
+                raise ValueError(f"The 'role' of resource_role_mapping key {key!r} must be a string")
             try:
                 role = get_role_by_name(rule["role"])
             except ValueError as e:
-                raise ValueError(f"Invalid role for dag_role_mapping key {key!r}: {e}") from None
-            grants.append(DagGrant(dags=dags.strip(), role=role, team=team.strip() if team else None))
+                raise ValueError(f"Invalid role for resource_role_mapping key {key!r}: {e}") from None
+            if role < (min_role := MIN_GRANT_ROLES[kind]):
+                raise ValueError(
+                    f"The role of a {kind.value!r} grant of resource_role_mapping key {key!r} must be at "
+                    f"least {min_role.name}"
+                )
+            grants.append(
+                ResourceGrant(
+                    kind=kind, pattern=pattern.strip(), role=role, team=team.strip() if team else None
+                )
+            )
         folded_key = key.casefold()
         if folded_key in mapping:
             raise ValueError(
-                f"dag_role_mapping key {key!r} is defined more than once (keys are case-insensitive)"
+                f"resource_role_mapping key {key!r} is defined more than once (keys are case-insensitive)"
             )
         mapping[folded_key] = grants
     return mapping
 
 
-def resolve_dag_groups(values: Sequence[str], mapping: Mapping[str, list[DagGrant]]) -> list[str]:
+def resolve_grant_groups(values: Sequence[str], mapping: Mapping[str, list[ResourceGrant]]) -> list[str]:
     """
-    Return the case-folded claim values that have Dag grants, sorted.
+    Return the case-folded claim values that have grants, sorted.
 
     :param values: group or role claim values
-    :param mapping: mapping returned by :func:`parse_dag_role_mapping`
+    :param mapping: mapping returned by :func:`parse_resource_role_mapping`
     """
     return sorted({value.casefold() for value in values if value.casefold() in mapping})
 
 
-def get_dag_role(
-    dag_groups: Sequence[str], mapping: Mapping[str, list[DagGrant]], dag_id: str, team_name: str | None
+def get_grant_role(
+    grant_groups: Sequence[str],
+    mapping: Mapping[str, list[ResourceGrant]],
+    kind: ResourceKind,
+    resource_id: str,
+    team_name: str | None,
 ) -> AdfsAuthManagerRole | None:
     """
-    Return the highest role the Dag grants of the user give on a Dag, if any.
+    Return the highest role the user's grants of a kind give on one resource, if any.
 
-    :param dag_groups: case-folded claim values of the user that have Dag grants
-    :param mapping: mapping returned by :func:`parse_dag_role_mapping`
-    :param dag_id: ID of the Dag
-    :param team_name: team of the Dag, if any
+    :param grant_groups: case-folded claim values of the user that have grants
+    :param mapping: mapping returned by :func:`parse_resource_role_mapping`
+    :param kind: kind of the resource
+    :param resource_id: Dag ID, connection ID, variable key or pool name of the resource
+    :param team_name: team of the resource, if any
     """
     roles = [
         grant.role
-        for group in dag_groups
+        for group in grant_groups
         for grant in mapping.get(group, ())
-        if grant.team == team_name and fnmatch.fnmatchcase(dag_id, grant.dags)
+        if grant.kind == kind and grant.team == team_name and fnmatch.fnmatchcase(resource_id, grant.pattern)
     ]
+    return max(roles) if roles else None
+
+
+def get_highest_grant_role(
+    grant_groups: Sequence[str], mapping: Mapping[str, list[ResourceGrant]], kind: ResourceKind
+) -> AdfsAuthManagerRole | None:
+    """
+    Return the highest role the user's grants of a kind give on any resource, of any team, if any.
+
+    :param grant_groups: case-folded claim values of the user that have grants
+    :param mapping: mapping returned by :func:`parse_resource_role_mapping`
+    :param kind: kind of the resources
+    """
+    roles = [grant.role for group in grant_groups for grant in mapping.get(group, ()) if grant.kind == kind]
     return max(roles) if roles else None
 
 

@@ -44,7 +44,8 @@ Required options
   ``https://<AD FS host>/adfs/.well-known/openid-configuration``.
 * ``client_id``: the identifier of the server or native application registered in AD FS.
 * ``role_mapping``: a JSON object mapping group or role claim values to Airflow roles, see
-  :doc:`permissions`. In multi-team mode it is optional when ``team_role_mapping`` is set.
+  :doc:`permissions`. It is optional when ``team_role_mapping`` (multi-team mode) or
+  ``resource_role_mapping`` is set.
 
 ``[api] base_url`` must also be set to the public URL of Airflow. The redirect URIs sent to AD FS are
 built from it and must match the URIs registered in AD FS exactly.
@@ -79,10 +80,10 @@ Other options
   ``upn,unique_name,email,sub``. ``sub`` comes last because AD FS issues an opaque value in it.
 * ``strip_domain_prefix``: remove the ``DOMAIN\`` prefix of the user name. Enable it only if user names
   are unique across the domains trusted by AD FS.
-* ``roles_claims``: claims holding the values matched against ``role_mapping`` and
-  ``team_role_mapping``.
-* ``dag_role_mapping``: a JSON object mapping group or role claim values to roles on some Dags, see
-  :ref:`Dag grants <adfs-dag-grants>`.
+* ``roles_claims``: claims holding the values matched against ``role_mapping``, ``team_role_mapping``
+  and ``resource_role_mapping``.
+* ``resource_role_mapping``: a JSON object mapping group or role claim values to roles on some Dags,
+  connections, variables or pools, see :ref:`resource grants <adfs-resource-grants>`.
 * ``team_role_mapping``: in multi-team mode, a JSON object mapping group or role claim values to a
   role in a team, see :ref:`multi-team <adfs-multi-team>`.
 * ``default_role``: role given to users matching no entry of ``role_mapping``. When empty, they are

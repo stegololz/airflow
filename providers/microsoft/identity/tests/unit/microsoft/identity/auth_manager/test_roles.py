@@ -22,14 +22,16 @@ import pytest
 from airflow.providers.microsoft.identity.auth_manager.oidc import AdfsAuthenticationError
 from airflow.providers.microsoft.identity.auth_manager.roles import (
     AdfsAuthManagerRole,
-    DagGrant,
+    ResourceGrant,
+    ResourceKind,
     get_claim_values,
-    get_dag_role,
+    get_grant_role,
+    get_highest_grant_role,
     get_role_by_name,
-    parse_dag_role_mapping,
+    parse_resource_role_mapping,
     parse_role_mapping,
     parse_team_role_mapping,
-    resolve_dag_groups,
+    resolve_grant_groups,
     resolve_role,
     resolve_team_roles,
     resolve_username,
@@ -198,123 +200,188 @@ OP = AdfsAuthManagerRole.OP
 ADMIN = AdfsAuthManagerRole.ADMIN
 
 
-class TestParseDagRoleMapping:
+DAGS = ResourceKind.DAGS
+CONNECTIONS = ResourceKind.CONNECTIONS
+VARIABLES = ResourceKind.VARIABLES
+POOLS = ResourceKind.POOLS
+
+GRANT_RULE_ERROR = (
+    "^Each grant of resource_role_mapping key 'Finance Ops' must be an object with one of 'dags', "
+    "'connections', 'variables' or 'pools', a 'role' and an optional 'team'$"
+)
+
+
+class TestParseResourceRoleMapping:
     def test_valid_mapping(self):
         raw = (
             '{"Finance Ops": [{"dags": " finance_* ", "role": "user"}, {"dags": "payroll", "role": "OP"}],'
             ' "CN=Audit,OU=Groups": [{"dags": "*", "role": "VIEWER"}]}'
         )
 
-        assert parse_dag_role_mapping(raw, multi_team=False) == {
-            "finance ops": [DagGrant("finance_*", USER, None), DagGrant("payroll", OP, None)],
-            "cn=audit,ou=groups": [DagGrant("*", VIEWER, None)],
+        assert parse_resource_role_mapping(raw, multi_team=False) == {
+            "finance ops": [
+                ResourceGrant(DAGS, "finance_*", USER, None),
+                ResourceGrant(DAGS, "payroll", OP, None),
+            ],
+            "cn=audit,ou=groups": [ResourceGrant(DAGS, "*", VIEWER, None)],
+        }
+
+    def test_valid_mapping_of_every_kind(self):
+        raw = (
+            '{"Finance Ops": [{"dags": "finance_*", "role": "USER"}, {"connections": " finance_* ", "role": "op"},'
+            ' {"variables": "finance_*", "role": "ADMIN"}, {"pools": "finance", "role": "VIEWER"}]}'
+        )
+
+        assert parse_resource_role_mapping(raw, multi_team=False) == {
+            "finance ops": [
+                ResourceGrant(DAGS, "finance_*", USER, None),
+                ResourceGrant(CONNECTIONS, "finance_*", OP, None),
+                ResourceGrant(VARIABLES, "finance_*", ADMIN, None),
+                ResourceGrant(POOLS, "finance", VIEWER, None),
+            ],
         }
 
     def test_valid_mapping_with_teams(self):
         raw = (
             '{"Team A Finance": [{"dags": "finance_*", "role": "ADMIN", "team": " team_a "},'
+            ' {"connections": "finance_*", "role": "OP", "team": "team_a"},'
             ' {"dags": "shared", "role": "VIEWER", "team": null}]}'
         )
 
-        assert parse_dag_role_mapping(raw, multi_team=True) == {
-            "team a finance": [DagGrant("finance_*", ADMIN, "team_a"), DagGrant("shared", VIEWER, None)],
+        assert parse_resource_role_mapping(raw, multi_team=True) == {
+            "team a finance": [
+                ResourceGrant(DAGS, "finance_*", ADMIN, "team_a"),
+                ResourceGrant(CONNECTIONS, "finance_*", OP, "team_a"),
+                ResourceGrant(DAGS, "shared", VIEWER, None),
+            ],
         }
 
     def test_empty_object(self):
-        assert parse_dag_role_mapping("{}", multi_team=False) == {}
+        assert parse_resource_role_mapping("{}", multi_team=False) == {}
 
     @pytest.mark.parametrize(
         ("raw", "multi_team", "match"),
         [
-            ("{not json", False, "^dag_role_mapping is not valid JSON"),
-            ('[{"dags": "a", "role": "OP"}]', False, "^dag_role_mapping must be a JSON object$"),
-            ('"Finance Ops"', False, "^dag_role_mapping must be a JSON object$"),
+            ("{not json", False, "^resource_role_mapping is not valid JSON"),
+            ('[{"dags": "a", "role": "OP"}]', False, "^resource_role_mapping must be a JSON object$"),
+            ('"Finance Ops"', False, "^resource_role_mapping must be a JSON object$"),
             (
                 '{"Finance Ops": []}',
                 False,
-                "^The value of dag_role_mapping key 'Finance Ops' must be a non-empty list$",
+                "^The value of resource_role_mapping key 'Finance Ops' must be a non-empty list$",
             ),
             (
                 '{"Finance Ops": {"dags": "a", "role": "OP"}}',
                 False,
-                "^The value of dag_role_mapping key 'Finance Ops' must be a non-empty list$",
+                "^The value of resource_role_mapping key 'Finance Ops' must be a non-empty list$",
             ),
             (
                 '{"Finance Ops": "OP"}',
                 False,
-                "^The value of dag_role_mapping key 'Finance Ops' must be a non-empty list$",
+                "^The value of resource_role_mapping key 'Finance Ops' must be a non-empty list$",
             ),
-            (
-                '{"Finance Ops": [{"dags": "a", "role": "OP", "teams": "team_a"}]}',
-                True,
-                "^Each rule of dag_role_mapping key 'Finance Ops' must be an object with 'dags', 'role' "
-                "and an optional 'team'$",
-            ),
-            ('{"Finance Ops": [{"role": "OP"}]}', False, "^Each rule of dag_role_mapping key 'Finance Ops'"),
-            ('{"Finance Ops": [{"dags": "a"}]}', False, "^Each rule of dag_role_mapping key 'Finance Ops'"),
-            ('{"Finance Ops": ["finance_*"]}', False, "^Each rule of dag_role_mapping key 'Finance Ops'"),
+            ('{"Finance Ops": [{"dags": "a", "role": "OP", "teams": "team_a"}]}', True, GRANT_RULE_ERROR),
+            ('{"Finance Ops": [{"role": "OP"}]}', False, GRANT_RULE_ERROR),
+            ('{"Finance Ops": [{"dags": "a"}]}', False, GRANT_RULE_ERROR),
+            ('{"Finance Ops": ["finance_*"]}', False, GRANT_RULE_ERROR),
+            ('{"Finance Ops": [{"dags": "a", "connections": "a", "role": "OP"}]}', False, GRANT_RULE_ERROR),
+            ('{"Finance Ops": [{"assets": "a", "role": "OP"}]}', False, GRANT_RULE_ERROR),
+            ('{"Finance Ops": [{"dag": "a", "role": "OP"}]}', False, GRANT_RULE_ERROR),
             (
                 '{"Finance Ops": [{"dags": "  ", "role": "OP"}]}',
                 False,
-                "^The 'dags' of dag_role_mapping key 'Finance Ops' must be a non-empty string$",
-            ),
-            (
-                '{"Finance Ops": [{"dags": "", "role": "OP"}]}',
-                False,
-                "^The 'dags' of dag_role_mapping key 'Finance Ops' must be a non-empty string$",
+                "^The 'dags' of resource_role_mapping key 'Finance Ops' must be a non-empty string$",
             ),
             (
                 '{"Finance Ops": [{"dags": ["a"], "role": "OP"}]}',
                 False,
-                "^The 'dags' of dag_role_mapping key 'Finance Ops' must be a non-empty string$",
+                "^The 'dags' of resource_role_mapping key 'Finance Ops' must be a non-empty string$",
+            ),
+            (
+                '{"Finance Ops": [{"connections": "", "role": "OP"}]}',
+                False,
+                "^The 'connections' of resource_role_mapping key 'Finance Ops' must be a non-empty string$",
+            ),
+            (
+                '{"Finance Ops": [{"variables": 1, "role": "OP"}]}',
+                False,
+                "^The 'variables' of resource_role_mapping key 'Finance Ops' must be a non-empty string$",
+            ),
+            (
+                '{"Finance Ops": [{"pools": " ", "role": "OP"}]}',
+                False,
+                "^The 'pools' of resource_role_mapping key 'Finance Ops' must be a non-empty string$",
             ),
             (
                 '{"Finance Ops": [{"dags": "a", "role": "SUPERUSER"}]}',
                 False,
-                "^Invalid role for dag_role_mapping key 'Finance Ops'",
+                "^Invalid role for resource_role_mapping key 'Finance Ops'",
             ),
             (
                 '{"Finance Ops": [{"dags": "a", "role": 3}]}',
                 False,
-                "^The 'role' of dag_role_mapping key 'Finance Ops' must be a string$",
+                "^The 'role' of resource_role_mapping key 'Finance Ops' must be a string$",
             ),
             (
-                '{"Finance Ops": [{"dags": "a", "role": "OP", "team": "team_a"}]}',
+                '{"Finance Ops": [{"connections": "a", "role": "USER"}]}',
                 False,
-                "^The 'team' of dag_role_mapping key 'Finance Ops' must be a team name and requires "
+                "^The role of a 'connections' grant of resource_role_mapping key 'Finance Ops' must be at "
+                "least OP$",
+            ),
+            (
+                '{"Finance Ops": [{"variables": "a", "role": "VIEWER"}]}',
+                False,
+                "^The role of a 'variables' grant of resource_role_mapping key 'Finance Ops' must be at "
+                "least OP$",
+            ),
+            (
+                '{"Finance Ops": [{"connections": "a", "role": "OP", "team": "team_a"}]}',
+                False,
+                "^The 'team' of resource_role_mapping key 'Finance Ops' must be a team name and requires "
                 "\\[core\\] multi_team$",
             ),
             (
                 '{"Finance Ops": [{"dags": "a", "role": "OP", "team": " "}]}',
                 True,
-                "^The 'team' of dag_role_mapping key 'Finance Ops' must be a team name",
+                "^The 'team' of resource_role_mapping key 'Finance Ops' must be a team name",
             ),
             (
                 '{"Finance Ops": [{"dags": "a", "role": "OP", "team": 1}]}',
                 True,
-                "^The 'team' of dag_role_mapping key 'Finance Ops' must be a team name",
+                "^The 'team' of resource_role_mapping key 'Finance Ops' must be a team name",
             ),
             (
-                '{"Finance Ops": [{"dags": "a", "role": "OP"}], "FINANCE OPS": [{"dags": "b", "role": "OP"}]}',
+                '{"Finance Ops": [{"dags": "a", "role": "OP"}], "FINANCE OPS": [{"pools": "b", "role": "OP"}]}',
                 False,
-                "^dag_role_mapping key 'FINANCE OPS' is defined more than once \\(keys are case-insensitive\\)$",
+                "^resource_role_mapping key 'FINANCE OPS' is defined more than once \\(keys are "
+                "case-insensitive\\)$",
             ),
         ],
     )
     def test_invalid_mapping(self, raw, multi_team, match):
         with pytest.raises(ValueError, match=match):
-            parse_dag_role_mapping(raw, multi_team=multi_team)
+            parse_resource_role_mapping(raw, multi_team=multi_team)
 
 
-DAG_MAPPING = {
-    "finance ops": [DagGrant("finance_*", USER, None)],
-    "finance auditors": [DagGrant("finance_*", VIEWER, None), DagGrant("audit_report", VIEWER, None)],
-    "payroll admins": [DagGrant("payroll_export", OP, None)],
-    "team a finance": [DagGrant("finance_*", OP, "team_a")],
+GRANT_MAPPING = {
+    "finance ops": [
+        ResourceGrant(DAGS, "finance_*", USER, None),
+        ResourceGrant(CONNECTIONS, "finance_*", OP, None),
+        ResourceGrant(POOLS, "finance", OP, None),
+    ],
+    "finance auditors": [
+        ResourceGrant(DAGS, "finance_*", VIEWER, None),
+        ResourceGrant(DAGS, "audit_report", VIEWER, None),
+    ],
+    "payroll admins": [ResourceGrant(DAGS, "payroll_export", OP, None)],
+    "team a finance": [
+        ResourceGrant(DAGS, "finance_*", OP, "team_a"),
+        ResourceGrant(VARIABLES, "finance_*", ADMIN, "team_a"),
+    ],
 }
 
 
-class TestResolveDagGroups:
+class TestResolveGrantGroups:
     @pytest.mark.parametrize(
         ("values", "expected"),
         [
@@ -325,44 +392,63 @@ class TestResolveDagGroups:
             ([], []),
         ],
     )
-    def test_resolve_dag_groups(self, values, expected):
-        assert resolve_dag_groups(values, DAG_MAPPING) == expected
+    def test_resolve_grant_groups(self, values, expected):
+        assert resolve_grant_groups(values, GRANT_MAPPING) == expected
 
 
-class TestGetDagRole:
+class TestGetGrantRole:
     @pytest.mark.parametrize(
-        ("dag_groups", "dag_id", "team_name", "expected"),
+        ("grant_groups", "kind", "resource_id", "team_name", "expected"),
         [
-            (["finance ops"], "finance_daily", None, USER),
-            (["finance ops"], "finance_", None, USER),
-            (["finance ops"], "finance", None, None),
-            (["finance ops"], "Finance_daily", None, None),
-            (["finance ops"], "FINANCE_DAILY", None, None),
-            (["finance ops"], "my_finance_daily", None, None),
-            (["finance auditors"], "audit_report", None, VIEWER),
-            (["finance auditors"], "audit_report_2", None, None),
-            (["finance auditors"], "Audit_Report", None, None),
-            (["payroll admins"], "payroll_export", None, OP),
-            (["payroll admins"], "payroll_exports", None, None),
-            (["finance ops", "finance auditors"], "finance_daily", None, USER),
-            (["finance auditors", "finance ops"], "finance_daily", None, USER),
-            (["finance auditors", "finance ops", "team a finance"], "finance_daily", None, USER),
-            (["team a finance"], "finance_daily", "team_a", OP),
-            (["team a finance"], "finance_daily", "team_b", None),
-            (["team a finance"], "finance_daily", None, None),
-            (["finance ops"], "finance_daily", "team_a", None),
-            (["finance ops", "team a finance"], "finance_daily", "team_a", OP),
-            (["unknown group"], "finance_daily", None, None),
-            (["unknown group", "finance auditors"], "finance_daily", None, VIEWER),
-            (["Finance Ops"], "finance_daily", None, None),
-            ([], "finance_daily", None, None),
+            (["finance ops"], DAGS, "finance_daily", None, USER),
+            (["finance ops"], DAGS, "finance_", None, USER),
+            (["finance ops"], DAGS, "finance", None, None),
+            (["finance ops"], DAGS, "Finance_daily", None, None),
+            (["finance ops"], DAGS, "my_finance_daily", None, None),
+            (["finance ops"], CONNECTIONS, "finance_db", None, OP),
+            (["finance ops"], CONNECTIONS, "FINANCE_DB", None, None),
+            (["finance ops"], POOLS, "finance", None, OP),
+            (["finance ops"], POOLS, "finance_2", None, None),
+            (["finance auditors"], DAGS, "audit_report", None, VIEWER),
+            (["finance auditors"], DAGS, "audit_report_2", None, None),
+            (["payroll admins"], DAGS, "payroll_export", None, OP),
+            (["finance ops", "finance auditors"], DAGS, "finance_daily", None, USER),
+            (["finance auditors", "finance ops"], DAGS, "finance_daily", None, USER),
+            (["team a finance"], DAGS, "finance_daily", "team_a", OP),
+            (["team a finance"], DAGS, "finance_daily", "team_b", None),
+            (["team a finance"], DAGS, "finance_daily", "TEAM_A", None),
+            (["team a finance"], DAGS, "finance_daily", None, None),
+            (["team a finance"], VARIABLES, "finance_rate", "team_a", ADMIN),
+            (["team a finance"], VARIABLES, "finance_rate", None, None),
+            (["finance ops"], DAGS, "finance_daily", "team_a", None),
+            (["finance ops"], CONNECTIONS, "finance_db", "team_a", None),
+            (["finance ops", "team a finance"], DAGS, "finance_daily", "team_a", OP),
+            (["unknown group"], DAGS, "finance_daily", None, None),
+            (["unknown group", "finance auditors"], DAGS, "finance_daily", None, VIEWER),
+            (["Finance Ops"], DAGS, "finance_daily", None, None),
+            ([], DAGS, "finance_daily", None, None),
         ],
     )
-    def test_get_dag_role(self, dag_groups, dag_id, team_name, expected):
-        assert get_dag_role(dag_groups, DAG_MAPPING, dag_id, team_name) == expected
+    def test_get_grant_role(self, grant_groups, kind, resource_id, team_name, expected):
+        assert get_grant_role(grant_groups, GRANT_MAPPING, kind, resource_id, team_name) == expected
 
     @pytest.mark.parametrize(
-        ("pattern", "dag_id", "expected"),
+        ("grant_kind", "checked_kind"),
+        [
+            (DAGS, CONNECTIONS),
+            (CONNECTIONS, VARIABLES),
+            (VARIABLES, POOLS),
+            (POOLS, DAGS),
+        ],
+    )
+    def test_grant_of_another_kind_gives_nothing(self, grant_kind, checked_kind):
+        mapping = {"g": [ResourceGrant(grant_kind, "finance_*", ADMIN, None)]}
+
+        assert get_grant_role(["g"], mapping, grant_kind, "finance_x", None) == ADMIN
+        assert get_grant_role(["g"], mapping, checked_kind, "finance_x", None) is None
+
+    @pytest.mark.parametrize(
+        ("pattern", "resource_id", "expected"),
         [
             ("etl_?", "etl_1", ADMIN),
             ("etl_?", "etl_10", None),
@@ -374,7 +460,26 @@ class TestGetDagRole:
             ("*", "anything", ADMIN),
         ],
     )
-    def test_fnmatch_patterns(self, pattern, dag_id, expected):
-        mapping = {"g": [DagGrant(pattern, ADMIN, None)]}
+    def test_fnmatch_patterns(self, pattern, resource_id, expected):
+        mapping = {"g": [ResourceGrant(CONNECTIONS, pattern, ADMIN, None)]}
 
-        assert get_dag_role(["g"], mapping, dag_id, None) == expected
+        assert get_grant_role(["g"], mapping, CONNECTIONS, resource_id, None) == expected
+
+
+class TestGetHighestGrantRole:
+    @pytest.mark.parametrize(
+        ("grant_groups", "kind", "expected"),
+        [
+            (["finance ops"], DAGS, USER),
+            (["finance ops"], CONNECTIONS, OP),
+            (["finance ops"], VARIABLES, None),
+            (["finance ops", "payroll admins"], DAGS, OP),
+            (["finance ops", "team a finance"], DAGS, OP),
+            (["team a finance"], VARIABLES, ADMIN),
+            (["finance auditors"], POOLS, None),
+            (["unknown group"], DAGS, None),
+            ([], DAGS, None),
+        ],
+    )
+    def test_get_highest_grant_role(self, grant_groups, kind, expected):
+        assert get_highest_grant_role(grant_groups, GRANT_MAPPING, kind) == expected
