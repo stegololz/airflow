@@ -46,6 +46,7 @@ from airflow.providers.microsoft.adfs.auth_manager.constants import (
     CONF_SCOPE_KEY,
     CONF_SECTION_NAME,
     CONF_STRIP_DOMAIN_PREFIX_KEY,
+    CONF_TEAM_ROLE_MAPPING_KEY,
     CONF_USERNAME_CLAIMS_KEY,
     DEFAULT_ROLES_CLAIMS,
     DEFAULT_SCOPE,
@@ -57,7 +58,9 @@ from airflow.providers.microsoft.adfs.auth_manager.roles import (
     get_claim_values,
     get_role_by_name,
     parse_role_mapping,
+    parse_team_role_mapping,
     resolve_role,
+    resolve_team_roles,
     resolve_username,
 )
 from airflow.providers.microsoft.adfs.auth_manager.user import AdfsAuthManagerUser
@@ -74,6 +77,7 @@ if TYPE_CHECKING:
         DagAccessEntity,
         DagDetails,
         PoolDetails,
+        TeamDetails,
         VariableDetails,
     )
     from airflow.api_fastapi.common.types import MenuItem
@@ -104,6 +108,11 @@ MENU_ITEM_MIN_ROLES: dict[str, AdfsAuthManagerRole] = {
 }
 
 
+def _get_team_name(details: Any) -> str | None:
+    # ``team_name`` is missing from resource details in older Airflow versions.
+    return getattr(details, "team_name", None)
+
+
 def _get_list_option(key: str, fallback: str) -> list[str]:
     raw = conf.get(CONF_SECTION_NAME, key, fallback=fallback) or ""
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -113,18 +122,14 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
     """
     Microsoft AD FS auth manager.
 
-    Users log in with the OpenID Connect authorization code flow. Their Airflow role is resolved
-    once at login from the group or role claims issued by AD FS and stored in the Airflow token,
-    so authorization does not call AD FS.
+    Users log in with the OpenID Connect authorization code flow. Their Airflow roles, global and per
+    team, are resolved once at login from the group or role claims issued by AD FS and stored in the
+    Airflow token, so authorization does not call AD FS.
     """
 
     def init(self) -> None:
-        # The base implementation lists the teams of the auth manager in multi-team mode, which this
-        # auth manager does not support.
-        if conf.getboolean("core", "multi_team", fallback=False):
-            raise ValueError("Multi-team mode is not supported by the AD FS auth manager")
-        super().init()
         self._validate_config()
+        super().init()
 
     def _validate_config(self) -> None:
         """
@@ -132,9 +137,16 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
 
         :meta private:
         """
-        for key in (CONF_ISSUER_KEY, CONF_CLIENT_ID_KEY, CONF_ROLE_MAPPING_KEY):
+        for key in (CONF_ISSUER_KEY, CONF_CLIENT_ID_KEY):
             if not conf.get(CONF_SECTION_NAME, key, fallback=None):
                 raise ValueError(f"[{CONF_SECTION_NAME}] {key} must be set")
+        has_team_roles = bool(conf.get(CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY, fallback=""))
+        if has_team_roles and not conf.getboolean("core", "multi_team", fallback=False):
+            raise ValueError(
+                f"[{CONF_SECTION_NAME}] {CONF_TEAM_ROLE_MAPPING_KEY} requires [core] multi_team to be enabled"
+            )
+        if not has_team_roles and not conf.get(CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY, fallback=None):
+            raise ValueError(f"[{CONF_SECTION_NAME}] {CONF_ROLE_MAPPING_KEY} must be set")
         if urlsplit(conf.get(CONF_SECTION_NAME, CONF_ISSUER_KEY)).scheme != "https":
             raise ValueError(f"[{CONF_SECTION_NAME}] {CONF_ISSUER_KEY} must be an https URL")
         if not _get_list_option(CONF_USERNAME_CLAIMS_KEY, DEFAULT_USERNAME_CLAIMS):
@@ -142,6 +154,7 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         # Parsing the role options here makes the API server fail at start-up on an invalid value
         # rather than at the first login.
         self.get_role_mapping()
+        self.get_team_role_mapping()
         self.get_default_role()
 
     @cached_property
@@ -165,7 +178,13 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
 
     @cached_property
     def _role_mapping(self) -> dict[str, AdfsAuthManagerRole]:
-        return parse_role_mapping(conf.get(CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY, fallback="") or "")
+        raw = conf.get(CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY, fallback="") or ""
+        return parse_role_mapping(raw) if raw else {}
+
+    @cached_property
+    def _team_role_mapping(self) -> dict[str, tuple[str, AdfsAuthManagerRole]]:
+        raw = conf.get(CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY, fallback="") or ""
+        return parse_team_role_mapping(raw) if raw else {}
 
     @cached_property
     def _default_role(self) -> AdfsAuthManagerRole | None:
@@ -179,6 +198,10 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
     def get_role_mapping(self) -> dict[str, AdfsAuthManagerRole]:
         """Return the mapping of case-folded group or role claim values to Airflow roles."""
         return self._role_mapping
+
+    def get_team_role_mapping(self) -> dict[str, tuple[str, AdfsAuthManagerRole]]:
+        """Return the mapping of case-folded group or role claim values to ``(team, role)`` tuples."""
+        return self._team_role_mapping
 
     def get_default_role(self) -> AdfsAuthManagerRole | None:
         """Return the role of users whose claims do not match the role mapping, if any."""
@@ -199,11 +222,14 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         )
         values = get_claim_values(claims, _get_list_option(CONF_ROLES_CLAIMS_KEY, DEFAULT_ROLES_CLAIMS))
         role = resolve_role(values, self.get_role_mapping(), self.get_default_role())
-        if role is None:
+        teams = resolve_team_roles(values, self.get_team_role_mapping())
+        if role is None and not teams:
             # Logged so that a renamed or missing group in AD FS can be diagnosed.
             log.info("User %s has no Airflow role; unmapped claim values: %s", username, values)
             raise PermissionError(f"User {username} is not mapped to an Airflow role")
-        return AdfsAuthManagerUser(user_id=username, name=self._get_display_name(claims, username), role=role)
+        return AdfsAuthManagerUser(
+            user_id=username, name=self._get_display_name(claims, username), role=role, teams=teams
+        )
 
     @staticmethod
     def _get_display_name(claims: Mapping[str, Any], username: str) -> str:
@@ -215,12 +241,24 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         return full_name or username
 
     def deserialize_user(self, token: dict[str, Any]) -> AdfsAuthManagerUser:
+        role = token["role"]
         return AdfsAuthManagerUser(
-            user_id=token["sub"], name=token["name"], role=AdfsAuthManagerRole[token["role"]]
+            user_id=token["sub"],
+            name=token["name"],
+            role=AdfsAuthManagerRole[role] if role is not None else None,
+            # Ignored once multi-team is turned off, so tokens issued before keep no team access.
+            teams={team: AdfsAuthManagerRole[name] for team, name in token.get("teams", {}).items()}
+            if conf.getboolean("core", "multi_team", fallback=False)
+            else {},
         )
 
     def serialize_user(self, user: AdfsAuthManagerUser) -> dict[str, Any]:
-        return {"sub": user.user_id, "name": user.name, "role": user.role.name}
+        return {
+            "sub": user.user_id,
+            "name": user.name,
+            "role": user.role.name if user.role is not None else None,
+            "teams": {team: role.name for team, role in user.teams.items()},
+        }
 
     def get_url_login(self, **kwargs) -> str:
         url = urljoin(conf.get("api", "base_url", fallback="/"), f"{AUTH_MANAGER_FASTAPI_APP_PREFIX}/login")
@@ -250,7 +288,12 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         details: ConnectionDetails | None = None,
     ) -> bool:
         return self._is_authorized(
-            method=method, user=user, read_role=AdfsAuthManagerRole.OP, write_role=AdfsAuthManagerRole.OP
+            method=method,
+            user=user,
+            read_role=AdfsAuthManagerRole.OP,
+            write_role=AdfsAuthManagerRole.OP,
+            team_name=_get_team_name(details),
+            any_team=method == "GET" and (details is None or details.conn_id is None),
         )
 
     def is_authorized_dag(
@@ -266,6 +309,9 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
             user=user,
             read_role=AdfsAuthManagerRole.VIEWER,
             write_role=AdfsAuthManagerRole.USER,
+            team_name=_get_team_name(details),
+            # Core checks each Dag again when a request names none, e.g. bulk task instance actions.
+            any_team=details is None or details.id is None,
         )
 
     def is_authorized_backfill(
@@ -301,36 +347,66 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         self, *, method: ResourceMethod, user: AdfsAuthManagerUser, details: PoolDetails | None = None
     ) -> bool:
         return self._is_authorized(
-            method=method, user=user, read_role=AdfsAuthManagerRole.VIEWER, write_role=AdfsAuthManagerRole.OP
+            method=method,
+            user=user,
+            read_role=AdfsAuthManagerRole.VIEWER,
+            write_role=AdfsAuthManagerRole.OP,
+            team_name=_get_team_name(details),
+        )
+
+    def is_authorized_team(
+        self, *, method: ResourceMethod, user: AdfsAuthManagerUser, details: TeamDetails | None = None
+    ) -> bool:
+        if details is None:
+            return False
+        return self._is_authorized(
+            method=method,
+            user=user,
+            read_role=AdfsAuthManagerRole.VIEWER,
+            write_role=AdfsAuthManagerRole.OP,
+            team_name=details.name,
         )
 
     def is_authorized_variable(
         self, *, method: ResourceMethod, user: AdfsAuthManagerUser, details: VariableDetails | None = None
     ) -> bool:
         return self._is_authorized(
-            method=method, user=user, read_role=AdfsAuthManagerRole.OP, write_role=AdfsAuthManagerRole.OP
+            method=method,
+            user=user,
+            read_role=AdfsAuthManagerRole.OP,
+            write_role=AdfsAuthManagerRole.OP,
+            team_name=_get_team_name(details),
+            any_team=method == "GET" and (details is None or details.key is None),
         )
 
     def is_authorized_view(
         self, *, access_view: AccessView, user: AdfsAuthManagerUser, team_name: str | None = None
     ) -> bool:
-        return access_view.value in VIEWER_ACCESS_VIEW_NAMES or user.role >= AdfsAuthManagerRole.ADMIN
+        return access_view.value in VIEWER_ACCESS_VIEW_NAMES or user.role == AdfsAuthManagerRole.ADMIN
 
     def is_authorized_custom_view(
         self, *, method: ResourceMethod | str, resource_name: str, user: AdfsAuthManagerUser
     ) -> bool:
-        # ``method`` can be any action defined by a plugin, which may change state.
+        # ``method`` can be any action defined by a plugin, which may change state. Plugins are not
+        # scoped to a team: any role can read them, only a global role can change state.
         return self._is_authorized(
-            method=method, user=user, read_role=AdfsAuthManagerRole.VIEWER, write_role=AdfsAuthManagerRole.OP
+            method=method,
+            user=user,
+            read_role=AdfsAuthManagerRole.VIEWER,
+            write_role=AdfsAuthManagerRole.OP,
+            any_team=method == "GET",
         )
 
     def filter_authorized_menu_items(
         self, menu_items: list[MenuItem], *, user: AdfsAuthManagerUser
     ) -> list[MenuItem]:
+        role = self._get_highest_role(user)
+        if role is None:
+            return []
         return [
             menu_item
             for menu_item in menu_items
-            if user.role >= MENU_ITEM_MIN_ROLES.get(menu_item.value, AdfsAuthManagerRole.VIEWER)
+            if role >= MENU_ITEM_MIN_ROLES.get(menu_item.value, AdfsAuthManagerRole.VIEWER)
         ]
 
     def get_fastapi_app(self) -> FastAPI | None:
@@ -347,21 +423,59 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
         app.include_router(login_router)
         return app
 
+    def _get_teams(self) -> set[str]:
+        return {team for team, _ in self.get_team_role_mapping().values()}
+
     @staticmethod
+    def _get_role(user: AdfsAuthManagerUser, team_name: str | None) -> AdfsAuthManagerRole | None:
+        """
+        Return the role of the user on a resource of the given team, or on a resource of no team.
+
+        A global ``ADMIN`` has every right. Other global roles do not apply to team resources. Members
+        of a team without a global role can read resources of no team.
+
+        :meta private:
+        """
+        if user.role == AdfsAuthManagerRole.ADMIN:
+            return user.role
+        if team_name:
+            return user.teams.get(team_name)
+        if user.role is not None:
+            return user.role
+        return AdfsAuthManagerRole.VIEWER if user.teams else None
+
+    @staticmethod
+    def _get_highest_role(user: AdfsAuthManagerUser) -> AdfsAuthManagerRole | None:
+        """
+        Return the highest role of the user, global or in a team.
+
+        :meta private:
+        """
+        roles = [role for role in (user.role, *user.teams.values()) if role is not None]
+        return max(roles) if roles else None
+
+    @classmethod
     def _is_authorized(
+        cls,
         *,
         method: ResourceMethod | str,
         user: AdfsAuthManagerUser,
         read_role: AdfsAuthManagerRole,
         write_role: AdfsAuthManagerRole,
+        team_name: str | None = None,
+        any_team: bool = False,
     ) -> bool:
         """
-        Return whether the user's role grants the method.
+        Return whether the user's role on the resource grants the method.
 
-        :param method: the method or plugin action to perform
+        :param method: the method to perform
         :param user: the user performing the action
         :param read_role: minimal role required for ``GET``
         :param write_role: minimal role required for any other method
+        :param team_name: team of the resource, if any
+        :param any_team: whether the check covers resources of any team, filtered per team by core
+            afterwards, in which case the highest role of the user applies
         :meta private:
         """
-        return user.role >= (read_role if method == "GET" else write_role)
+        role = cls._get_highest_role(user) if any_team and not team_name else cls._get_role(user, team_name)
+        return role is not None and role >= (read_role if method == "GET" else write_role)

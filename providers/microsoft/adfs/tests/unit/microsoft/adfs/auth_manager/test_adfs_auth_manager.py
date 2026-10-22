@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json
+import warnings
 from unittest.mock import Mock, patch
 
 import pytest
@@ -31,6 +33,7 @@ from airflow.api_fastapi.auth.managers.models.resource_details import (
     DagAccessEntity,
     DagDetails,
     PoolDetails,
+    TeamDetails,
     VariableDetails,
 )
 from airflow.api_fastapi.common.types import MenuItem
@@ -51,6 +54,7 @@ from airflow.providers.microsoft.adfs.auth_manager.constants import (
     CONF_SCOPE_KEY,
     CONF_SECTION_NAME,
     CONF_STRIP_DOMAIN_PREFIX_KEY,
+    CONF_TEAM_ROLE_MAPPING_KEY,
     CONF_USERNAME_CLAIMS_KEY,
     DEFAULT_SCOPE,
 )
@@ -114,9 +118,29 @@ RESOURCE_CASES = [
     ("variable", "POST", OP, True),
 ]
 
+TEAM_ROLE_MAPPING = json.dumps(
+    {
+        "Team A Viewers": "team_a:VIEWER",
+        "Team A Operators": "team_a:OP",
+        "Team B Users": "team_b:USER",
+    }
+)
+MULTI_TEAM_CONF = {
+    ("core", "multi_team"): "True",
+    (CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY): TEAM_ROLE_MAPPING,
+}
 
-def _user(role: AdfsAuthManagerRole) -> AdfsAuthManagerUser:
-    return AdfsAuthManagerUser(user_id="jdoe@example.com", name="John Doe", role=role)
+
+def _user(
+    role: AdfsAuthManagerRole | None, teams: dict[str, AdfsAuthManagerRole] | None = None
+) -> AdfsAuthManagerUser:
+    return AdfsAuthManagerUser(user_id="jdoe@example.com", name="John Doe", role=role, teams=teams or {})
+
+
+@pytest.fixture
+def multi_team_auth_manager():
+    with conf_vars({**AUTH_MANAGER_CONF, **MULTI_TEAM_CONF}):
+        yield AdfsAuthManager()
 
 
 class TestAdfsAuthManager:
@@ -197,8 +221,47 @@ class TestAdfsAuthManager:
 
         serialized = auth_manager.serialize_user(user)
 
-        assert serialized == {"sub": "jdoe@example.com", "name": "John Doe", "role": "OP"}
+        assert serialized == {"sub": "jdoe@example.com", "name": "John Doe", "role": "OP", "teams": {}}
         assert auth_manager.deserialize_user(serialized) == user
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_serialize_user_with_teams_round_trip(self, auth_manager):
+        user = _user(None, {"team_a": OP, "team_b": VIEWER})
+
+        serialized = auth_manager.serialize_user(user)
+
+        assert serialized == {
+            "sub": "jdoe@example.com",
+            "name": "John Doe",
+            "role": None,
+            "teams": {"team_a": "OP", "team_b": "VIEWER"},
+        }
+        assert auth_manager.deserialize_user(serialized) == user
+
+    def test_deserialize_user_without_teams(self, auth_manager):
+        token = {"sub": "jdoe@example.com", "name": "John Doe", "role": "OP"}
+
+        assert auth_manager.deserialize_user(token) == _user(OP)
+
+    @conf_vars({("core", "multi_team"): "True"})
+    def test_deserialize_user_invalid_team_role(self, auth_manager):
+        token = {
+            "sub": "jdoe@example.com",
+            "name": "John Doe",
+            "role": None,
+            "teams": {"team_a": "SUPERUSER"},
+        }
+
+        with pytest.raises(KeyError):
+            auth_manager.deserialize_user(token)
+
+    def test_deserialize_user_ignores_teams_without_multi_team(self, auth_manager):
+        token = {"sub": "jdoe@example.com", "name": "John Doe", "role": None, "teams": {"team_a": "OP"}}
+
+        user = auth_manager.deserialize_user(token)
+
+        assert user == _user(None)
+        assert auth_manager.is_authorized_dag(method="GET", user=user, details=DagDetails(id="dag")) is False
 
     @pytest.mark.parametrize(
         "token",
@@ -291,6 +354,42 @@ class TestAdfsAuthManager:
     def test_init(self, auth_manager):
         auth_manager.init()
 
+    @patch(
+        "airflow.api_fastapi.auth.managers.base_auth_manager.Team.get_all_team_names",
+        return_value={"team_a", "team_b"},
+    )
+    def test_init_multi_team(self, _, multi_team_auth_manager):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            multi_team_auth_manager.init()
+
+    @conf_vars({(CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY): None})
+    @patch(
+        "airflow.api_fastapi.auth.managers.base_auth_manager.Team.get_all_team_names",
+        return_value={"team_a", "team_b"},
+    )
+    def test_init_multi_team_without_role_mapping(self, _, multi_team_auth_manager):
+        multi_team_auth_manager.init()
+
+    @patch(
+        "airflow.api_fastapi.auth.managers.base_auth_manager.Team.get_all_team_names",
+        return_value={"team_a", "team_c"},
+    )
+    def test_init_multi_team_warns_on_team_mismatch(self, _, multi_team_auth_manager):
+        with pytest.warns(UserWarning, match="Teams defined") as record:
+            multi_team_auth_manager.init()
+
+        assert [str(w.message) for w in record] == [
+            "Teams defined in the auth manager are not present in the database ({'team_b'}).",
+            "Teams defined in the database are not present in the auth manager ({'team_c'}).",
+        ]
+
+    def test_get_teams(self, multi_team_auth_manager):
+        assert multi_team_auth_manager._get_teams() == {"team_a", "team_b"}
+
+    def test_get_teams_without_team_role_mapping(self, auth_manager):
+        assert auth_manager._get_teams() == set()
+
     @pytest.mark.parametrize(
         ("overrides", "match"),
         [
@@ -301,7 +400,39 @@ class TestAdfsAuthManager:
             ({(CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY): '{"Airflow Admins": "ROOT"}'}, "Airflow Admins"),
             ({(CONF_SECTION_NAME, CONF_DEFAULT_ROLE_KEY): "ROOT"}, "ROOT"),
             ({(CONF_SECTION_NAME, CONF_USERNAME_CLAIMS_KEY): " , "}, "username_claims"),
-            ({("core", "multi_team"): "True"}, "Multi-team"),
+            (
+                {(CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY): TEAM_ROLE_MAPPING},
+                "team_role_mapping requires \\[core\\] multi_team",
+            ),
+            (
+                {("core", "multi_team"): "True", (CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY): None},
+                "role_mapping must be set",
+            ),
+            (
+                {**MULTI_TEAM_CONF, (CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY): "{not json"},
+                "not valid JSON",
+            ),
+            (
+                {**MULTI_TEAM_CONF, (CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY): '{"Team A": "OP"}'},
+                "'Team A' must be a '<team>:<role>' string",
+            ),
+            (
+                {
+                    **MULTI_TEAM_CONF,
+                    (CONF_SECTION_NAME, CONF_TEAM_ROLE_MAPPING_KEY): '{"Team A": "team_a:ROOT"}',
+                },
+                "Invalid role for team_role_mapping key 'Team A'",
+            ),
+            (
+                {
+                    **MULTI_TEAM_CONF,
+                    (
+                        CONF_SECTION_NAME,
+                        CONF_TEAM_ROLE_MAPPING_KEY,
+                    ): '{"Team A": "team_a:OP", "TEAM A": "team_a:VIEWER"}',
+                },
+                "'TEAM A' is defined more than once",
+            ),
         ],
     )
     def test_init_invalid_config(self, overrides, match):
@@ -364,4 +495,229 @@ class TestGetUserFromClaims:
         assert (
             auth_manager.get_user_from_claims({"upn": "jdoe@example.com", "role": "Domain Users"}).role
             == VIEWER
+        )
+
+
+class TestGetUserFromClaimsMultiTeam:
+    def test_global_and_team_roles(self, multi_team_auth_manager):
+        claims = {
+            "upn": "jdoe@example.com",
+            "name": "John Doe",
+            "groups": ["Airflow Users", "Team A Viewers", "Team B Users"],
+        }
+
+        assert multi_team_auth_manager.get_user_from_claims(claims) == _user(
+            USER, {"team_a": VIEWER, "team_b": USER}
+        )
+
+    def test_highest_role_per_team(self, multi_team_auth_manager):
+        claims = {"upn": "jdoe@example.com", "groups": ["Team A Operators", "team a viewers"]}
+
+        assert multi_team_auth_manager.get_user_from_claims(claims).teams == {"team_a": OP}
+
+    def test_team_roles_only(self, multi_team_auth_manager):
+        user = multi_team_auth_manager.get_user_from_claims(
+            {"upn": "jdoe@example.com", "role": "Team B Users"}
+        )
+
+        assert user.role is None
+        assert user.teams == {"team_b": USER}
+
+    @conf_vars({(CONF_SECTION_NAME, CONF_ROLE_MAPPING_KEY): None})
+    def test_without_role_mapping(self, multi_team_auth_manager):
+        user = multi_team_auth_manager.get_user_from_claims(
+            {"upn": "jdoe@example.com", "role": "Team B Users"}
+        )
+
+        assert (user.role, user.teams) == (None, {"team_b": USER})
+
+    def test_no_global_nor_team_role(self, multi_team_auth_manager):
+        with pytest.raises(PermissionError):
+            multi_team_auth_manager.get_user_from_claims({"upn": "jdoe@example.com", "role": "Domain Users"})
+
+
+# Resource name: (method name, extra keyword arguments), for resources of team_a
+TEAM_A_RESOURCES = {
+    "connection": (
+        "is_authorized_connection",
+        {"details": ConnectionDetails(conn_id="c", team_name="team_a")},
+    ),
+    "dag": ("is_authorized_dag", {"details": DagDetails(id="dag", team_name="team_a")}),
+    "dag_run": (
+        "is_authorized_dag",
+        {"access_entity": DagAccessEntity.RUN, "details": DagDetails(id="dag", team_name="team_a")},
+    ),
+    "pool": ("is_authorized_pool", {"details": PoolDetails(name="pool", team_name="team_a")}),
+    "variable": ("is_authorized_variable", {"details": VariableDetails(key="key", team_name="team_a")}),
+}
+
+GLOBAL_ADMIN = _user(ADMIN)
+GLOBAL_OP = _user(OP)
+TEAM_A_VIEWER = _user(None, {"team_a": VIEWER})
+TEAM_A_USER = _user(None, {"team_a": USER})
+TEAM_A_OP = _user(None, {"team_a": OP})
+TEAM_B_ADMIN = _user(None, {"team_b": ADMIN})
+TEAM_A_OP_GLOBAL_VIEWER = _user(VIEWER, {"team_a": OP})
+
+
+class TestMultiTeamAuthorization:
+    @pytest.mark.parametrize(
+        ("resource", "method", "user", "expected"),
+        [
+            ("connection", "DELETE", GLOBAL_ADMIN, True),
+            ("variable", "POST", GLOBAL_ADMIN, True),
+            ("dag", "POST", GLOBAL_ADMIN, True),
+            ("connection", "GET", GLOBAL_OP, False),
+            ("variable", "GET", GLOBAL_OP, False),
+            ("pool", "GET", GLOBAL_OP, False),
+            ("dag", "GET", GLOBAL_OP, False),
+            ("connection", "GET", TEAM_A_OP, True),
+            ("connection", "POST", TEAM_A_OP, True),
+            ("variable", "GET", TEAM_A_OP, True),
+            ("variable", "DELETE", TEAM_A_OP, True),
+            ("pool", "POST", TEAM_A_OP, True),
+            ("dag", "POST", TEAM_A_OP, True),
+            ("dag_run", "POST", TEAM_A_OP, True),
+            ("connection", "GET", TEAM_A_USER, False),
+            ("variable", "GET", TEAM_A_USER, False),
+            ("pool", "GET", TEAM_A_USER, True),
+            ("pool", "POST", TEAM_A_USER, False),
+            ("dag", "POST", TEAM_A_USER, True),
+            ("dag_run", "POST", TEAM_A_USER, True),
+            ("dag", "GET", TEAM_A_VIEWER, True),
+            ("dag", "POST", TEAM_A_VIEWER, False),
+            ("connection", "GET", TEAM_B_ADMIN, False),
+            ("variable", "GET", TEAM_B_ADMIN, False),
+            ("pool", "GET", TEAM_B_ADMIN, False),
+            ("dag", "GET", TEAM_B_ADMIN, False),
+            ("connection", "POST", TEAM_A_OP_GLOBAL_VIEWER, True),
+        ],
+    )
+    def test_is_authorized_team_resource(self, auth_manager, resource, method, user, expected):
+        method_name, kwargs = TEAM_A_RESOURCES[resource]
+        is_authorized = getattr(auth_manager, method_name)
+
+        assert is_authorized(method=method, user=user, **kwargs) is expected
+
+    @pytest.mark.parametrize(
+        ("resource", "method", "user", "expected"),
+        [
+            ("dag", "GET", TEAM_A_OP, True),
+            ("dag", "POST", TEAM_A_OP, False),
+            ("all_dags", "GET", TEAM_A_OP, True),
+            ("all_dags", "POST", TEAM_A_OP, True),
+            ("pool", "GET", TEAM_A_OP, True),
+            ("pool", "POST", TEAM_A_OP, False),
+            ("connection", "GET", TEAM_A_OP, False),
+            ("variable", "GET", TEAM_A_OP, False),
+            ("configuration", "GET", TEAM_A_OP, True),
+            ("configuration", "POST", TEAM_A_OP, False),
+            ("asset", "GET", TEAM_A_OP, True),
+            ("asset", "POST", TEAM_A_OP, False),
+            ("asset_alias", "GET", TEAM_A_OP, True),
+            ("asset_alias", "POST", TEAM_A_OP, False),
+            ("dag", "POST", TEAM_A_OP_GLOBAL_VIEWER, False),
+            ("connection", "GET", TEAM_A_OP_GLOBAL_VIEWER, False),
+            ("connection", "GET", GLOBAL_OP, True),
+        ],
+    )
+    def test_is_authorized_resource_without_team(self, auth_manager, resource, method, user, expected):
+        method_name, kwargs = RESOURCES[resource]
+        is_authorized = getattr(auth_manager, method_name)
+
+        assert is_authorized(method=method, user=user, **kwargs) is expected
+
+    @pytest.mark.parametrize(
+        ("access_view", "user", "expected"),
+        [
+            (AccessView.DOCS, TEAM_A_VIEWER, True),
+            (AccessView.IMPORT_ERRORS, TEAM_A_VIEWER, True),
+            (AccessView.AUDIT_LOGS_ALL, TEAM_B_ADMIN, False),
+            (AccessView.REPARSE_ALL, TEAM_B_ADMIN, False),
+            (AccessView.REPARSE_ALL, GLOBAL_ADMIN, True),
+        ],
+    )
+    def test_is_authorized_view(self, auth_manager, access_view, user, expected):
+        assert (
+            auth_manager.is_authorized_view(access_view=access_view, user=user, team_name="team_b")
+            is expected
+        )
+
+    @pytest.mark.parametrize(
+        ("details", "user", "expected"),
+        [
+            (TeamDetails(name="team_a"), TEAM_A_VIEWER, True),
+            (TeamDetails(name="team_b"), TEAM_A_OP, False),
+            (TeamDetails(name="team_b"), GLOBAL_ADMIN, True),
+            (TeamDetails(name="team_a"), GLOBAL_OP, False),
+            (None, TEAM_A_OP, False),
+        ],
+    )
+    def test_is_authorized_team(self, auth_manager, details, user, expected):
+        assert auth_manager.is_authorized_team(method="GET", user=user, details=details) is expected
+
+    @pytest.mark.parametrize(
+        ("method", "user", "expected"),
+        [("POST", TEAM_A_VIEWER, False), ("DELETE", TEAM_A_USER, False), ("POST", TEAM_A_OP, True)],
+    )
+    def test_is_authorized_team_write(self, auth_manager, method, user, expected):
+        details = TeamDetails(name="team_a")
+
+        assert auth_manager.is_authorized_team(method=method, user=user, details=details) is expected
+
+    @pytest.mark.parametrize(
+        ("method_name", "details", "method", "user", "expected"),
+        [
+            ("is_authorized_connection", ConnectionDetails(), "GET", TEAM_A_OP, True),
+            ("is_authorized_variable", VariableDetails(), "GET", TEAM_A_OP, True),
+            ("is_authorized_variable", VariableDetails(), "GET", TEAM_A_USER, False),
+            ("is_authorized_connection", ConnectionDetails(), "POST", TEAM_A_OP, False),
+            ("is_authorized_variable", None, "POST", TEAM_A_OP, False),
+        ],
+    )
+    def test_is_authorized_list(self, auth_manager, method_name, details, method, user, expected):
+        is_authorized = getattr(auth_manager, method_name)
+
+        assert is_authorized(method=method, user=user, details=details) is expected
+
+    def test_filter_authorized_teams(self, auth_manager):
+        user = _user(None, {"team_a": VIEWER, "team_b": USER})
+
+        assert auth_manager.filter_authorized_teams(
+            teams_names={"team_a", "team_b", "team_c"}, user=user
+        ) == {
+            "team_a",
+            "team_b",
+        }
+
+    @pytest.mark.parametrize(
+        ("user", "hidden_items"),
+        [
+            (TEAM_A_USER, {MenuItem.CONNECTIONS, MenuItem.VARIABLES}),
+            (TEAM_A_OP, set()),
+            (TEAM_A_OP_GLOBAL_VIEWER, set()),
+            (_user(None), set(MenuItem)),
+        ],
+    )
+    def test_filter_authorized_menu_items(self, auth_manager, user, hidden_items):
+        menu_items = list(MenuItem)
+
+        result = auth_manager.filter_authorized_menu_items(menu_items, user=user)
+
+        assert result == [item for item in menu_items if item not in hidden_items]
+
+    @pytest.mark.parametrize(
+        ("method", "user", "expected"),
+        [
+            ("GET", TEAM_A_VIEWER, True),
+            ("POST", TEAM_A_USER, False),
+            ("POST", TEAM_A_OP, False),
+            ("can_trigger", TEAM_A_OP_GLOBAL_VIEWER, False),
+            ("GET", _user(None), False),
+        ],
+    )
+    def test_is_authorized_custom_view(self, auth_manager, method, user, expected):
+        assert (
+            auth_manager.is_authorized_custom_view(method=method, resource_name="plugin", user=user)
+            is expected
         )

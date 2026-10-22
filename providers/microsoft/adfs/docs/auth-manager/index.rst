@@ -60,5 +60,4 @@ Limitations
   sooner.
 * Before Airflow 3.2, logging out deletes the Airflow token cookie but does not revoke the token,
   which stays valid until it expires.
-* Multi-team mode (``[core] multi_team``) is not supported.
 * There is no endpoint to exchange AD FS credentials or tokens for an Airflow API token yet.

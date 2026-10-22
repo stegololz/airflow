@@ -25,7 +25,9 @@ from airflow.providers.microsoft.adfs.auth_manager.roles import (
     get_claim_values,
     get_role_by_name,
     parse_role_mapping,
+    parse_team_role_mapping,
     resolve_role,
+    resolve_team_roles,
     resolve_username,
 )
 
@@ -129,3 +131,58 @@ class TestResolveRole:
     )
     def test_resolve_role(self, values, default_role, expected):
         assert resolve_role(values, self.MAPPING, default_role) == expected
+
+
+class TestParseTeamRoleMapping:
+    def test_valid_mapping(self):
+        assert parse_team_role_mapping(
+            '{"Team A Ops": "team_a:OP", "CN=B,OU=Groups": " team_b : viewer", "Ns": "ns:x:admin"}'
+        ) == {
+            "team a ops": ("team_a", AdfsAuthManagerRole.OP),
+            "cn=b,ou=groups": ("team_b", AdfsAuthManagerRole.VIEWER),
+            "ns": ("ns:x", AdfsAuthManagerRole.ADMIN),
+        }
+
+    @pytest.mark.parametrize(
+        ("raw", "match"),
+        [
+            ("{not json", "not valid JSON"),
+            ('["Team A Ops"]', "JSON object"),
+            ('{"Team A Ops": "OP"}', "'Team A Ops' must be a '<team>:<role>' string"),
+            ('{"Team A Ops": " :OP"}', "'Team A Ops' must be a '<team>:<role>' string"),
+            ('{"Team A Ops": 3}', "'Team A Ops' must be a '<team>:<role>' string"),
+            ('{"Team A Ops": "team_a:SUPERUSER"}', "Invalid role for team_role_mapping key 'Team A Ops'"),
+            ('{"Team A Ops": "team_a:"}', "Invalid role for team_role_mapping key 'Team A Ops'"),
+            (
+                '{"Team A Ops": "team_a:OP", "TEAM A OPS": "team_b:OP"}',
+                "'TEAM A OPS' is defined more than once",
+            ),
+        ],
+    )
+    def test_invalid_mapping(self, raw, match):
+        with pytest.raises(ValueError, match=match):
+            parse_team_role_mapping(raw)
+
+
+class TestResolveTeamRoles:
+    MAPPING = {
+        "team a viewers": ("team_a", AdfsAuthManagerRole.VIEWER),
+        "team a ops": ("team_a", AdfsAuthManagerRole.OP),
+        "team b users": ("team_b", AdfsAuthManagerRole.USER),
+    }
+
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            (["Team A Ops", "Team A Viewers"], {"team_a": AdfsAuthManagerRole.OP}),
+            (["Team A Viewers", "Team A Ops"], {"team_a": AdfsAuthManagerRole.OP}),
+            (
+                ["TEAM B USERS", "Domain Users", "team a viewers"],
+                {"team_b": AdfsAuthManagerRole.USER, "team_a": AdfsAuthManagerRole.VIEWER},
+            ),
+            (["Domain Users"], {}),
+            ([], {}),
+        ],
+    )
+    def test_resolve_team_roles(self, values, expected):
+        assert resolve_team_roles(values, self.MAPPING) == expected

@@ -103,11 +103,18 @@ def get_provider_info():
                         "default": "role,roles,group,groups,http://schemas.microsoft.com/ws/2008/06/identity/claims/role",
                     },
                     "role_mapping": {
-                        "description": "JSON object mapping group or role claim values to Airflow roles. Keys are matched\ncase-insensitively. Allowed roles are ``VIEWER``, ``USER``, ``OP`` and ``ADMIN``. When several\nvalues match, the highest role is used.\n",
+                        "description": "JSON object mapping group or role claim values to global Airflow roles. Keys are matched\ncase-insensitively. Allowed roles are ``VIEWER``, ``USER``, ``OP`` and ``ADMIN``. When several\nvalues match, the highest role is used. Optional in multi-team mode when\n``team_role_mapping`` is set.\n",
                         "type": "string",
                         "version_added": "0.1.0",
                         "example": '{"Airflow Admins": "ADMIN", "Airflow Operators": "OP", "Airflow Users": "USER"}',
                         "default": None,
+                    },
+                    "team_role_mapping": {
+                        "description": 'JSON object mapping group or role claim values to a role in a team, as ``"<team>:<role>"``\nstrings, in multi-team mode. Keys are matched case-insensitively. When several values match\nthe same team, the highest role is used. Only users with a global ``ADMIN`` role from\n``role_mapping`` access every team.\n',
+                        "type": "string",
+                        "version_added": "0.1.0",
+                        "example": '{"Airflow team-a Operators": "team-a:OP", "Airflow team-b Viewers": "team-b:VIEWER"}',
+                        "default": "",
                     },
                     "default_role": {
                         "description": "Airflow role given to an authenticated user whose claims do not match ``role_mapping``. When\nempty, such users are denied access.\n",

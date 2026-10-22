@@ -89,6 +89,54 @@ def parse_role_mapping(raw: str) -> dict[str, AdfsAuthManagerRole]:
     return mapping
 
 
+def parse_team_role_mapping(raw: str) -> dict[str, tuple[str, AdfsAuthManagerRole]]:
+    """
+    Parse the ``team_role_mapping`` option.
+
+    :param raw: JSON object mapping claim values to ``"<team>:<role>"`` strings
+    :return: mapping of case-folded claim values to ``(team, role)`` tuples
+    """
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"team_role_mapping is not valid JSON: {e.msg} (position {e.pos})") from None
+    if not isinstance(loaded, dict):
+        raise ValueError("team_role_mapping must be a JSON object")
+    mapping: dict[str, tuple[str, AdfsAuthManagerRole]] = {}
+    for key, value in loaded.items():
+        team, _, role_name = value.rpartition(":") if isinstance(value, str) else ("", "", "")
+        if not team.strip():
+            raise ValueError(f"The value of team_role_mapping key {key!r} must be a '<team>:<role>' string")
+        try:
+            role = get_role_by_name(role_name)
+        except ValueError as e:
+            raise ValueError(f"Invalid role for team_role_mapping key {key!r}: {e}") from None
+        folded_key = key.casefold()
+        if folded_key in mapping:
+            raise ValueError(
+                f"team_role_mapping key {key!r} is defined more than once (keys are case-insensitive)"
+            )
+        mapping[folded_key] = (team.strip(), role)
+    return mapping
+
+
+def resolve_team_roles(
+    values: Sequence[str], mapping: Mapping[str, tuple[str, AdfsAuthManagerRole]]
+) -> dict[str, AdfsAuthManagerRole]:
+    """
+    Return the highest role of the user in each team mapped from the claim values.
+
+    :param values: group or role claim values
+    :param mapping: mapping returned by :func:`parse_team_role_mapping`
+    """
+    teams: dict[str, AdfsAuthManagerRole] = {}
+    for value in values:
+        if (team_role := mapping.get(value.casefold())) is not None:
+            team, role = team_role
+            teams[team] = max(role, teams.get(team, role))
+    return teams
+
+
 def resolve_username(claims: Mapping[str, Any], claim_names: Sequence[str], *, strip_domain: bool) -> str:
     r"""
     Return the user name from the first claim holding a non-blank string.

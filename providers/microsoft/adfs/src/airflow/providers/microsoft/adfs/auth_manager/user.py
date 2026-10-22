@@ -29,12 +29,14 @@ class AdfsAuthManagerUser(BaseModel, BaseUser):
 
     :param user_id: user name read from the token claims, used as the Airflow user identifier
     :param name: display name of the user
-    :param role: Airflow role resolved from the group or role claims at login
+    :param role: global Airflow role resolved from the group or role claims at login, if any
+    :param teams: Airflow role of the user in each team, in multi-team mode
     """
 
     user_id: str
     name: str
-    role: AdfsAuthManagerRole
+    role: AdfsAuthManagerRole | None
+    teams: dict[str, AdfsAuthManagerRole] = {}
 
     def get_id(self) -> str:
         return self.user_id

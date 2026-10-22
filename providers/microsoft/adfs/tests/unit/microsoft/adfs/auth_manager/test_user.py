@@ -28,3 +28,20 @@ class TestAdfsAuthManagerUser:
         assert user.get_id() == "jdoe@example.com"
         assert user.get_name() == "jdoe@example.com"
         assert user.get_display_name() == "John Doe"
+
+    def test_user_defaults_to_no_team(self):
+        user = AdfsAuthManagerUser(user_id="jdoe@example.com", name="John Doe", role=AdfsAuthManagerRole.OP)
+
+        assert user.teams == {}
+
+    def test_user_with_teams_only(self):
+        user = AdfsAuthManagerUser(
+            user_id="jdoe@example.com",
+            name="John Doe",
+            role=None,
+            teams={"team_a": AdfsAuthManagerRole.OP, "team_b": AdfsAuthManagerRole.VIEWER},
+        )
+
+        assert user.role is None
+        assert user.teams == {"team_a": AdfsAuthManagerRole.OP, "team_b": AdfsAuthManagerRole.VIEWER}
+        assert user.get_id() == "jdoe@example.com"

@@ -19,7 +19,8 @@
 Permissions
 ===========
 
-Each user has one Airflow role, resolved at login from the group or role claims issued by AD FS.
+Each user has a global Airflow role and, in :ref:`multi-team <adfs-multi-team>` mode, a role per team,
+resolved at login from the group or role claims issued by AD FS.
 
 Role mapping
 ------------
@@ -63,3 +64,34 @@ The cluster activity, documentation, import errors, jobs, plugins, providers, tr
 views are available to every role. Any other view, such as the audit log, import errors and reparsing
 of files not tied to a Dag, requires ``ADMIN``. The Connections and Variables menu entries are shown
 to ``OP`` and ``ADMIN`` only.
+
+.. _adfs-multi-team:
+
+Multi-team
+----------
+
+With ``[core] multi_team`` enabled, ``[adfs_auth_manager] team_role_mapping`` gives users a role in a
+team. It maps claim values to ``"<team>:<role>"`` strings:
+
+.. code-block:: json
+
+  {
+    "Airflow team-a Operators": "team-a:OP",
+    "Airflow team-a Viewers": "team-a:VIEWER",
+    "Airflow team-b Users": "team-b:USER"
+  }
+
+A user can have a role in several teams; when several values match the same team, the highest role is
+used. ``role_mapping`` stays optional and gives the global role.
+
+* Dags, connections, pools and variables of a team are authorized with the user's role in that team.
+  A global ``ADMIN`` can access every team; other global roles do not apply to team resources.
+* Resources of no team (shared Dags, connections, pools and variables, assets, configuration) are
+  authorized with the global role. Members of a team without a global role can read them as
+  ``VIEWER``.
+* Menu entries, list pages and plugin views use the highest role of the user, global or in a team;
+  the rows listed are still filtered per team. Plugin actions that change state need a global role.
+* Team members can read their team's plugin APIs; changing state through them needs ``OP`` in the
+  team.
+* The teams listed in ``team_role_mapping`` must exist in Airflow (``airflow teams create``).
+  Differences are logged as warnings when the API server starts.
