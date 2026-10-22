@@ -1061,7 +1061,7 @@ def install_airflow_and_providers(
             console.print("[yellow]Uninstalling Airflow-3 only providers\n")
             providers_to_uninstall_for_airflow_2 = [
                 "apache-airflow-providers-keycloak",
-                "apache-airflow-providers-microsoft-adfs",
+                "apache-airflow-providers-microsoft-identity",
                 "apache-airflow-providers-common-messaging",
                 "apache-airflow-providers-git",
                 "apache-airflow-providers-edge3",

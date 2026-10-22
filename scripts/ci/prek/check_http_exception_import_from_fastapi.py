@@ -21,7 +21,7 @@
 The hook is wired into per-distribution ``.pre-commit-config.yaml`` files
 (``airflow-core``, ``providers/amazon``, ``providers/common/ai``,
 ``providers/edge3``, ``providers/fab``, ``providers/keycloak``,
-``providers/microsoft/adfs``), each
+``providers/microsoft/identity``), each
 scoped to the subtree that actually wires a FastAPI app. In
 ``airflow-core`` that includes ``api_fastapi/`` and
 ``utils/serve_logs/`` (the worker log-serving FastAPI app). Provider

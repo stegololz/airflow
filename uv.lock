@@ -109,8 +109,8 @@ apache-airflow-providers-informatica = false
 apache-airflow-providers-jdbc = false
 apache-airflow-providers-jenkins = false
 apache-airflow-providers-keycloak = false
-apache-airflow-providers-microsoft-adfs = false
 apache-airflow-providers-microsoft-azure = false
+apache-airflow-providers-microsoft-identity = false
 apache-airflow-providers-microsoft-mssql = false
 apache-airflow-providers-microsoft-psrp = false
 apache-airflow-providers-microsoft-winrm = false
@@ -257,8 +257,8 @@ members = [
     "apache-airflow-providers-jdbc",
     "apache-airflow-providers-jenkins",
     "apache-airflow-providers-keycloak",
-    "apache-airflow-providers-microsoft-adfs",
     "apache-airflow-providers-microsoft-azure",
+    "apache-airflow-providers-microsoft-identity",
     "apache-airflow-providers-microsoft-mssql",
     "apache-airflow-providers-microsoft-psrp",
     "apache-airflow-providers-microsoft-winrm",
@@ -6675,45 +6675,6 @@ dev = [
 docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "devel-common" }]
 
 [[package]]
-name = "apache-airflow-providers-microsoft-adfs"
-version = "0.1.0"
-source = { editable = "providers/microsoft/adfs" }
-dependencies = [
-    { name = "apache-airflow" },
-    { name = "apache-airflow-providers-common-compat" },
-    { name = "pyjwt", extra = ["crypto"] },
-    { name = "requests" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "apache-airflow" },
-    { name = "apache-airflow-devel-common" },
-    { name = "apache-airflow-providers-common-compat" },
-    { name = "apache-airflow-task-sdk" },
-]
-docs = [
-    { name = "apache-airflow-devel-common", extra = ["docs"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "apache-airflow", editable = "." },
-    { name = "apache-airflow-providers-common-compat", editable = "providers/common/compat" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.11.0" },
-    { name = "requests", specifier = ">=2.32.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "apache-airflow", editable = "." },
-    { name = "apache-airflow-devel-common", editable = "devel-common" },
-    { name = "apache-airflow-providers-common-compat", editable = "providers/common/compat" },
-    { name = "apache-airflow-task-sdk", editable = "task-sdk" },
-]
-docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "devel-common" }]
-
-[[package]]
 name = "apache-airflow-providers-microsoft-azure"
 version = "15.3.0"
 source = { editable = "providers/microsoft/azure" }
@@ -6852,6 +6813,45 @@ dev = [
     { name = "apache-airflow-task-sdk", editable = "task-sdk" },
     { name = "moto", specifier = ">=5.1.2" },
     { name = "pywinrm", specifier = ">=0.5.0" },
+]
+docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "devel-common" }]
+
+[[package]]
+name = "apache-airflow-providers-microsoft-identity"
+version = "0.1.0"
+source = { editable = "providers/microsoft/identity" }
+dependencies = [
+    { name = "apache-airflow" },
+    { name = "apache-airflow-providers-common-compat" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "requests" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "apache-airflow" },
+    { name = "apache-airflow-devel-common" },
+    { name = "apache-airflow-providers-common-compat" },
+    { name = "apache-airflow-task-sdk" },
+]
+docs = [
+    { name = "apache-airflow-devel-common", extra = ["docs"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "apache-airflow", editable = "." },
+    { name = "apache-airflow-providers-common-compat", editable = "providers/common/compat" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.11.0" },
+    { name = "requests", specifier = ">=2.32.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "apache-airflow", editable = "." },
+    { name = "apache-airflow-devel-common", editable = "devel-common" },
+    { name = "apache-airflow-providers-common-compat", editable = "providers/common/compat" },
+    { name = "apache-airflow-task-sdk", editable = "task-sdk" },
 ]
 docs = [{ name = "apache-airflow-devel-common", extras = ["docs"], editable = "devel-common" }]
 

@@ -174,8 +174,8 @@ body:
         - jdbc
         - jenkins
         - keycloak
-        - microsoft-adfs
         - microsoft-azure
+        - microsoft-identity
         - microsoft-mssql
         - microsoft-psrp
         - microsoft-winrm
