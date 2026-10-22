@@ -221,7 +221,13 @@ class TestAdfsAuthManager:
 
         serialized = auth_manager.serialize_user(user)
 
-        assert serialized == {"sub": "jdoe@example.com", "name": "John Doe", "role": "OP", "teams": {}}
+        assert serialized == {
+            "sub": "jdoe@example.com",
+            "name": "John Doe",
+            "role": "OP",
+            "teams": {},
+            "dag_groups": [],
+        }
         assert auth_manager.deserialize_user(serialized) == user
 
     @conf_vars({("core", "multi_team"): "True"})
@@ -235,6 +241,7 @@ class TestAdfsAuthManager:
             "name": "John Doe",
             "role": None,
             "teams": {"team_a": "OP", "team_b": "VIEWER"},
+            "dag_groups": [],
         }
         assert auth_manager.deserialize_user(serialized) == user
 

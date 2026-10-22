@@ -22,10 +22,14 @@ import pytest
 from airflow.providers.microsoft.identity.auth_manager.oidc import AdfsAuthenticationError
 from airflow.providers.microsoft.identity.auth_manager.roles import (
     AdfsAuthManagerRole,
+    DagGrant,
     get_claim_values,
+    get_dag_role,
     get_role_by_name,
+    parse_dag_role_mapping,
     parse_role_mapping,
     parse_team_role_mapping,
+    resolve_dag_groups,
     resolve_role,
     resolve_team_roles,
     resolve_username,
@@ -186,3 +190,191 @@ class TestResolveTeamRoles:
     )
     def test_resolve_team_roles(self, values, expected):
         assert resolve_team_roles(values, self.MAPPING) == expected
+
+
+VIEWER = AdfsAuthManagerRole.VIEWER
+USER = AdfsAuthManagerRole.USER
+OP = AdfsAuthManagerRole.OP
+ADMIN = AdfsAuthManagerRole.ADMIN
+
+
+class TestParseDagRoleMapping:
+    def test_valid_mapping(self):
+        raw = (
+            '{"Finance Ops": [{"dags": " finance_* ", "role": "user"}, {"dags": "payroll", "role": "OP"}],'
+            ' "CN=Audit,OU=Groups": [{"dags": "*", "role": "VIEWER"}]}'
+        )
+
+        assert parse_dag_role_mapping(raw, multi_team=False) == {
+            "finance ops": [DagGrant("finance_*", USER, None), DagGrant("payroll", OP, None)],
+            "cn=audit,ou=groups": [DagGrant("*", VIEWER, None)],
+        }
+
+    def test_valid_mapping_with_teams(self):
+        raw = (
+            '{"Team A Finance": [{"dags": "finance_*", "role": "ADMIN", "team": " team_a "},'
+            ' {"dags": "shared", "role": "VIEWER", "team": null}]}'
+        )
+
+        assert parse_dag_role_mapping(raw, multi_team=True) == {
+            "team a finance": [DagGrant("finance_*", ADMIN, "team_a"), DagGrant("shared", VIEWER, None)],
+        }
+
+    def test_empty_object(self):
+        assert parse_dag_role_mapping("{}", multi_team=False) == {}
+
+    @pytest.mark.parametrize(
+        ("raw", "multi_team", "match"),
+        [
+            ("{not json", False, "^dag_role_mapping is not valid JSON"),
+            ('[{"dags": "a", "role": "OP"}]', False, "^dag_role_mapping must be a JSON object$"),
+            ('"Finance Ops"', False, "^dag_role_mapping must be a JSON object$"),
+            (
+                '{"Finance Ops": []}',
+                False,
+                "^The value of dag_role_mapping key 'Finance Ops' must be a non-empty list$",
+            ),
+            (
+                '{"Finance Ops": {"dags": "a", "role": "OP"}}',
+                False,
+                "^The value of dag_role_mapping key 'Finance Ops' must be a non-empty list$",
+            ),
+            (
+                '{"Finance Ops": "OP"}',
+                False,
+                "^The value of dag_role_mapping key 'Finance Ops' must be a non-empty list$",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": "OP", "teams": "team_a"}]}',
+                True,
+                "^Each rule of dag_role_mapping key 'Finance Ops' must be an object with 'dags', 'role' "
+                "and an optional 'team'$",
+            ),
+            ('{"Finance Ops": [{"role": "OP"}]}', False, "^Each rule of dag_role_mapping key 'Finance Ops'"),
+            ('{"Finance Ops": [{"dags": "a"}]}', False, "^Each rule of dag_role_mapping key 'Finance Ops'"),
+            ('{"Finance Ops": ["finance_*"]}', False, "^Each rule of dag_role_mapping key 'Finance Ops'"),
+            (
+                '{"Finance Ops": [{"dags": "  ", "role": "OP"}]}',
+                False,
+                "^The 'dags' of dag_role_mapping key 'Finance Ops' must be a non-empty string$",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "", "role": "OP"}]}',
+                False,
+                "^The 'dags' of dag_role_mapping key 'Finance Ops' must be a non-empty string$",
+            ),
+            (
+                '{"Finance Ops": [{"dags": ["a"], "role": "OP"}]}',
+                False,
+                "^The 'dags' of dag_role_mapping key 'Finance Ops' must be a non-empty string$",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": "SUPERUSER"}]}',
+                False,
+                "^Invalid role for dag_role_mapping key 'Finance Ops'",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": 3}]}',
+                False,
+                "^The 'role' of dag_role_mapping key 'Finance Ops' must be a string$",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": "OP", "team": "team_a"}]}',
+                False,
+                "^The 'team' of dag_role_mapping key 'Finance Ops' must be a team name and requires "
+                "\\[core\\] multi_team$",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": "OP", "team": " "}]}',
+                True,
+                "^The 'team' of dag_role_mapping key 'Finance Ops' must be a team name",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": "OP", "team": 1}]}',
+                True,
+                "^The 'team' of dag_role_mapping key 'Finance Ops' must be a team name",
+            ),
+            (
+                '{"Finance Ops": [{"dags": "a", "role": "OP"}], "FINANCE OPS": [{"dags": "b", "role": "OP"}]}',
+                False,
+                "^dag_role_mapping key 'FINANCE OPS' is defined more than once \\(keys are case-insensitive\\)$",
+            ),
+        ],
+    )
+    def test_invalid_mapping(self, raw, multi_team, match):
+        with pytest.raises(ValueError, match=match):
+            parse_dag_role_mapping(raw, multi_team=multi_team)
+
+
+DAG_MAPPING = {
+    "finance ops": [DagGrant("finance_*", USER, None)],
+    "finance auditors": [DagGrant("finance_*", VIEWER, None), DagGrant("audit_report", VIEWER, None)],
+    "payroll admins": [DagGrant("payroll_export", OP, None)],
+    "team a finance": [DagGrant("finance_*", OP, "team_a")],
+}
+
+
+class TestResolveDagGroups:
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            (["Finance Ops"], ["finance ops"]),
+            (["FINANCE OPS", "finance ops", "Finance Auditors"], ["finance auditors", "finance ops"]),
+            (["Payroll Admins", "Domain Users", "Finance Ops"], ["finance ops", "payroll admins"]),
+            (["Domain Users", "Airflow Admins"], []),
+            ([], []),
+        ],
+    )
+    def test_resolve_dag_groups(self, values, expected):
+        assert resolve_dag_groups(values, DAG_MAPPING) == expected
+
+
+class TestGetDagRole:
+    @pytest.mark.parametrize(
+        ("dag_groups", "dag_id", "team_name", "expected"),
+        [
+            (["finance ops"], "finance_daily", None, USER),
+            (["finance ops"], "finance_", None, USER),
+            (["finance ops"], "finance", None, None),
+            (["finance ops"], "Finance_daily", None, None),
+            (["finance ops"], "FINANCE_DAILY", None, None),
+            (["finance ops"], "my_finance_daily", None, None),
+            (["finance auditors"], "audit_report", None, VIEWER),
+            (["finance auditors"], "audit_report_2", None, None),
+            (["finance auditors"], "Audit_Report", None, None),
+            (["payroll admins"], "payroll_export", None, OP),
+            (["payroll admins"], "payroll_exports", None, None),
+            (["finance ops", "finance auditors"], "finance_daily", None, USER),
+            (["finance auditors", "finance ops"], "finance_daily", None, USER),
+            (["finance auditors", "finance ops", "team a finance"], "finance_daily", None, USER),
+            (["team a finance"], "finance_daily", "team_a", OP),
+            (["team a finance"], "finance_daily", "team_b", None),
+            (["team a finance"], "finance_daily", None, None),
+            (["finance ops"], "finance_daily", "team_a", None),
+            (["finance ops", "team a finance"], "finance_daily", "team_a", OP),
+            (["unknown group"], "finance_daily", None, None),
+            (["unknown group", "finance auditors"], "finance_daily", None, VIEWER),
+            (["Finance Ops"], "finance_daily", None, None),
+            ([], "finance_daily", None, None),
+        ],
+    )
+    def test_get_dag_role(self, dag_groups, dag_id, team_name, expected):
+        assert get_dag_role(dag_groups, DAG_MAPPING, dag_id, team_name) == expected
+
+    @pytest.mark.parametrize(
+        ("pattern", "dag_id", "expected"),
+        [
+            ("etl_?", "etl_1", ADMIN),
+            ("etl_?", "etl_10", None),
+            ("etl_[ab]", "etl_b", ADMIN),
+            ("etl_[ab]", "etl_c", None),
+            ("etl_[!ab]", "etl_c", ADMIN),
+            ("etl.daily", "etl.daily", ADMIN),
+            ("etl.daily", "etlxdaily", None),
+            ("*", "anything", ADMIN),
+        ],
+    )
+    def test_fnmatch_patterns(self, pattern, dag_id, expected):
+        mapping = {"g": [DagGrant(pattern, ADMIN, None)]}
+
+        assert get_dag_role(["g"], mapping, dag_id, None) == expected

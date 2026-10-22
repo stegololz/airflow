@@ -119,7 +119,7 @@ def get_provider_info():
                         "default": "",
                     },
                     "dag_role_mapping": {
-                        "description": "JSON object mapping group or role claim values to lists of Dag grants, each an object with\n``dags`` (a Dag ID or an ``fnmatch`` pattern, matched case-sensitively), ``role`` and, in\nmulti-team mode, ``team``. A grant only applies to the Dags of its team, or to Dags of no team\nwhen ``team`` is omitted. Grants add to the global and team roles and never remove access.\nRules are checked on every request against the configuration loaded by the API server:\nremoving one takes effect when the API server restarts, without users logging in again.\nAdding one takes effect at the next login of the users it concerns.\n",
+                        "description": "JSON object mapping group or role claim values to lists of Dag grants, each an object with\n``dags`` (a Dag ID or an ``fnmatch`` pattern, matched case-sensitively), ``role`` and, in\nmulti-team mode, ``team``. A grant only applies to the Dags of its team, or to Dags of no team\nwhen ``team`` is omitted. Grants add to the global and team roles and never remove access.\nGrants are loaded when the API server starts. After a restart, changed or removed grants\napply to every session, current ones included. A claim value the user did not have when\nlogging in only counts after their next login.\n",
                         "type": "string",
                         "version_added": "0.1.0",
                         "example": '{"Finance Ops": [{"dags": "finance_*", "role": "USER"}]}',

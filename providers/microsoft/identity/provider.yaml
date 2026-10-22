@@ -145,9 +145,9 @@ config:
           ``dags`` (a Dag ID or an ``fnmatch`` pattern, matched case-sensitively), ``role`` and, in
           multi-team mode, ``team``. A grant only applies to the Dags of its team, or to Dags of no team
           when ``team`` is omitted. Grants add to the global and team roles and never remove access.
-          Rules are checked on every request against the configuration loaded by the API server:
-          removing one takes effect when the API server restarts, without users logging in again.
-          Adding one takes effect at the next login of the users it concerns.
+          Grants are loaded when the API server starts. After a restart, changed or removed grants
+          apply to every session, current ones included. A claim value the user did not have when
+          logging in only counts after their next login.
         type: string
         version_added: 0.1.0
         example: '{"Finance Ops": [{"dags": "finance_*", "role": "USER"}]}'

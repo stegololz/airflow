@@ -336,8 +336,9 @@ class AdfsAuthManager(BaseAuthManager[AdfsAuthManagerUser]):
     ) -> bool:
         team_name = _get_team_name(details)
         if details is None or details.id is None:
-            # Core checks each Dag again when a request names none, e.g. bulk task instance actions.
-            role = self._get_highest_role(user, include_dag_grants=True)
+            # Lists are filtered per Dag by core. Writes naming no Dag are not re-checked per Dag by every
+            # supported Airflow version (backfills before 3.1.8), so Dag grants never authorize them.
+            role = self._get_highest_role(user, include_dag_grants=method == "GET")
         else:
             roles = [
                 self._get_role(user, team_name),

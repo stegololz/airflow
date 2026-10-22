@@ -89,9 +89,10 @@ lists of grants, each with ``dags`` (a Dag ID, or an ``fnmatch`` pattern such as
 * Patterns match the Dag ID, which Dag authors choose. In multi-team mode, add ``"team"`` to a grant: it
   then only applies to the Dags of that team's bundles, so a Dag added by another team cannot match it.
   A grant without ``team`` applies to Dags of no team only.
-* Grants are checked on every request against the configuration loaded by the API server, without
-  calling AD FS: removing a grant takes effect when the API server restarts, without users logging in
-  again. A user gets a newly added grant at their next login.
+* Grants are checked in memory, without calling AD FS, against the configuration loaded when the API
+  server starts. After a restart, changed or removed grants apply to every session, current ones
+  included. A claim value the user did not have when logging in, such as a group they were just added
+  to, only counts after their next login, and a removed group membership after their token expires.
 
 .. _adfs-multi-team:
 
